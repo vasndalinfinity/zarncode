@@ -1,0 +1,751 @@
+//! Chat provider implementation
+//!
+//! Supports Chat API with Coding Agent authentication headers.
+
+use std::collections::hash_map::DefaultHasher;
+use std::env::consts::{ARCH, OS};
+use std::hash::{Hash, Hasher};
+
+use async_openai::types::chat::FinishReason;
+use async_openai::types::chat::Role as OpenAIRole;
+use async_trait::async_trait;
+use futures::StreamExt;
+
+use hostname::get;
+use reqwest::Client;
+use reqwest::header::HeaderMap;
+use reqwest_eventsource::{Error as EventSourceError, RequestBuilderExt};
+use serde::{Deserialize, Serialize};
+use serde_json::{from_str, to_string_pretty};
+use std::result::Result as StdResult;
+
+use crate::error::{LlmError, Result, StreamErrorCategory};
+use crate::llm::provider::LLMProvider;
+use crate::llm::types::{ChatConfig, Message, Role};
+use crate::tools::Tool;
+use std::sync::Arc;
+
+use crate::llm::provider::LlmStreamEvent;
+/// Custom delta that includes reasoning_content for Chat API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ChatDelta {
+  #[serde(default)]
+  content: Option<String>,
+  #[serde(default)]
+  reasoning_content: Option<String>,
+  #[serde(default)]
+  role: Option<OpenAIRole>,
+  #[serde(default)]
+  tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+/// Tool call from Chat API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ChatToolCall {
+  id: Option<String>,
+  #[serde(rename = "type")]
+  call_type: Option<String>,
+  function: Option<ChatToolFunction>,
+  index: Option<u32>,
+}
+
+/// Tool function from Chat API
+#[derive(Debug, Clone, Deserialize)]
+struct ChatToolFunction {
+  name: Option<String>,
+  arguments: Option<String>,
+}
+
+/// Custom choice stream for Chat API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ChatChoice {
+  index: u32,
+  delta: ChatDelta,
+  #[serde(default)]
+  finish_reason: Option<FinishReason>,
+}
+
+/// Custom stream response for Chat API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ChatStreamResponse {
+  id: String,
+  object: String,
+  #[serde(deserialize_with = "deserialize_created")]
+  created: u32,
+  model: String,
+  choices: Vec<ChatChoice>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  usage: Option<ChatUsage>,
+}
+
+/// Token usage information from Chat API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ChatUsage {
+  prompt_tokens: u32,
+  completion_tokens: u32,
+  total_tokens: u32,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  cached_tokens: Option<u32>,
+  #[serde(default)]
+  prompt_tokens_details: Option<ChatPromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatPromptTokensDetails {
+  #[serde(default)]
+  cached_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod usage_tests {
+  use super::*;
+  #[test]
+  fn usage_preserves_cache_reports_in_both_api_formats() {
+    for (extra, expected) in [
+      ("", None),
+      (",\"cached_tokens\":40", Some(40)),
+      (
+        ",\"prompt_tokens_details\":{\"cached_tokens\":30}",
+        Some(30),
+      ),
+      (
+        ",\"cached_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":30}",
+        Some(0),
+      ),
+    ] {
+      let usage: ChatUsage = serde_json::from_str(&format!(
+        "{{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120{extra}}}"
+      ))
+      .unwrap();
+      match LlmStreamEvent::from(usage) {
+        LlmStreamEvent::Usage {
+          cached_tokens,
+          total_tokens,
+          ..
+        } => {
+          assert_eq!(cached_tokens, expected);
+          assert_eq!(total_tokens, 120);
+        }
+        _ => panic!("expected usage"),
+      }
+    }
+  }
+}
+
+impl From<ChatUsage> for LlmStreamEvent {
+  fn from(usage: ChatUsage) -> Self {
+    Self::Usage {
+      total_tokens: usage.total_tokens,
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      cached_tokens: usage.cached_tokens.or_else(|| {
+        usage
+          .prompt_tokens_details
+          .and_then(|details| details.cached_tokens)
+      }),
+    }
+  }
+}
+
+/// Custom deserializer for created field (handles both i64 and u32)
+fn deserialize_created<'de, D>(deserializer: D) -> StdResult<u32, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let value: i64 = serde::Deserialize::deserialize(deserializer)?;
+  Ok(value as u32)
+}
+
+/// Client version used for the optional coding-agent headers
+const CHAT_CLI_VERSION: &str = "1.16.0";
+/// User-Agent header value for Coding Agent
+const CHAT_USER_AGENT: &str = "zarncode/5.2.1";
+
+/// Thinking configuration for Chat API
+#[derive(Debug, Clone, Serialize)]
+struct ThinkingConfig {
+  #[serde(rename = "type")]
+  thinking_type: String,
+}
+
+/// Content item for multi-modal messages
+#[derive(Debug, Clone, Serialize)]
+struct ContentItem {
+  #[serde(rename = "type")]
+  item_type: String,
+  text: String,
+}
+
+/// Chat completion request message
+#[derive(Debug, Clone, Serialize)]
+struct ChatMessage {
+  role: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  content: Option<serde_json::Value>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  tool_calls: Option<Vec<RequestToolCall>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  tool_call_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  reasoning_content: Option<String>,
+}
+
+/// Tool call in request
+#[derive(Debug, Clone, Serialize)]
+struct RequestToolCall {
+  id: String,
+  #[serde(rename = "type")]
+  call_type: String,
+  function: RequestToolFunction,
+}
+
+/// Tool function in request
+#[derive(Debug, Clone, Serialize)]
+struct RequestToolFunction {
+  name: String,
+  arguments: String,
+}
+
+/// Tool definition for function calling
+#[derive(Debug, Clone, Serialize)]
+struct ToolDefinition {
+  #[serde(rename = "type")]
+  tool_type: String,
+  function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolFunction {
+  name: String,
+  description: String,
+  parameters: serde_json::Value,
+}
+
+/// Chat completion request body
+#[derive(Debug, Clone, Serialize)]
+struct ChatCompletionRequest {
+  model: String,
+  messages: Vec<ChatMessage>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  max_tokens: Option<u32>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  temperature: Option<f32>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  stream: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  tools: Option<Vec<ToolDefinition>>,
+  /// Thinking mode configuration for Chat API
+  #[serde(skip_serializing_if = "Option::is_none")]
+  thinking: Option<ThinkingConfig>,
+  /// Stream options to include usage information
+  #[serde(skip_serializing_if = "Option::is_none")]
+  stream_options: Option<StreamOptions>,
+}
+
+/// Stream options for controlling streaming behavior
+#[derive(Debug, Clone, Serialize)]
+struct StreamOptions {
+  /// Include usage information in the final chunk
+  include_usage: bool,
+}
+
+/// Chat provider with Coding Agent support
+pub struct ChatCompatProvider {
+  http_client: reqwest::Client,
+  base_url: String,
+  config: ChatConfig,
+  api_key: String,
+  coding_agent: bool,
+  max_context_size: usize,
+  tool_registry: Arc<crate::tools::ToolRegistry>,
+}
+
+impl std::fmt::Debug for ChatCompatProvider {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChatCompatProvider")
+      .field("base_url", &self.base_url)
+      .field("config", &self.config)
+      .field("coding_agent", &self.coding_agent)
+      .field("max_context_size", &self.max_context_size)
+      .field("api_key", &"***")
+      .finish()
+  }
+}
+
+impl Clone for ChatCompatProvider {
+  fn clone(&self) -> Self {
+    Self {
+      http_client: self.http_client.clone(),
+      base_url: self.base_url.clone(),
+      config: self.config.clone(),
+      api_key: self.api_key.clone(),
+      coding_agent: self.coding_agent,
+      max_context_size: self.max_context_size,
+      tool_registry: self.tool_registry.clone(),
+    }
+  }
+}
+
+impl ChatCompatProvider {
+  /// Create a new Chat provider
+  ///
+  /// # Arguments
+  /// * `base_url` - Chat API base URL (e.g., "https://api.moonshot.cn/v1")
+  /// * `api_key` - API key
+  /// * `config` - Chat configuration (includes enable_thinking)
+  /// * `coding_agent` - Whether to use Coding Agent headers for inline-code-model model
+  /// * `max_context_size` - Maximum context size for the model
+  pub fn new(
+    base_url: impl Into<String>,
+    api_key: impl Into<String>,
+    config: ChatConfig,
+    coding_agent: bool,
+    max_context_size: usize,
+    tool_registry: Arc<crate::tools::ToolRegistry>,
+  ) -> Result<Self> {
+    let base_url = base_url.into();
+    let api_key = api_key.into();
+
+    let http_client = Self::create_http_client(&api_key, coding_agent)?;
+
+    Ok(Self {
+      http_client,
+      base_url,
+      config,
+      api_key,
+      coding_agent,
+      max_context_size,
+      tool_registry,
+    })
+  }
+
+  /// Build the HTTP client with the given API key and Coding Agent setting.
+  fn create_http_client(api_key: &str, coding_agent: bool) -> Result<reqwest::Client> {
+    let mut custom_headers = HeaderMap::new();
+
+    custom_headers.insert(
+      "Authorization",
+      format!("Bearer {}", api_key)
+        .parse()
+        .map_err(|_| LlmError::InvalidConfig("Invalid Authorization header".to_string()))?,
+    );
+    custom_headers.insert(
+      "Content-Type",
+      "application/json"
+        .parse()
+        .map_err(|_| LlmError::InvalidConfig("Invalid Content-Type header".to_string()))?,
+    );
+
+    if coding_agent {
+      log::info!("ChatCompatProvider: Adding Coding Agent headers");
+
+      let version = CHAT_CLI_VERSION;
+      let user_agent = CHAT_USER_AGENT;
+
+      let device_name = get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+      let device_model = format!("{}-{}", OS, ARCH);
+      let os_version = OS.to_string();
+      let device_id = generate_device_id(&device_name);
+
+      custom_headers.insert(
+        "User-Agent",
+        user_agent
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid User-Agent".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Platform",
+        "zarncode"
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Platform".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Version",
+        version
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Version".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Device-Name",
+        device_name
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Device-Name".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Device-Model",
+        device_model
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Device-Model".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Os-Version",
+        os_version
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Os-Version".to_string()))?,
+      );
+      custom_headers.insert(
+        "X-Msh-Device-Id",
+        device_id
+          .parse()
+          .map_err(|_| LlmError::InvalidConfig("Invalid X-Msh-Device-Id".to_string()))?,
+      );
+
+      log::info!("ChatCompatProvider: Configured custom headers:");
+      for (name, value) in &custom_headers {
+        if let Ok(v) = value.to_str() {
+          if name.as_str().to_lowercase() == "authorization" {
+            log::info!("  {}: ***masked***", name);
+          } else {
+            log::info!("  {}: {}", name, v);
+          }
+        }
+      }
+    } else {
+      log::info!("ChatCompatProvider: Not using Coding Agent headers");
+    }
+
+    Client::builder()
+      .default_headers(custom_headers)
+      .build()
+      .map_err(|e| LlmError::InvalidConfig(format!("Failed to build HTTP client: {}", e)).into())
+  }
+
+  /// Convert our Message type to ChatMessage
+  fn convert_message(msg: &Message) -> ChatMessage {
+    let role = match msg.role {
+      Role::System => "system",
+      Role::User => "user",
+      Role::Assistant => "assistant",
+      Role::Tool => "tool",
+    };
+
+    // Convert tool_calls if present
+    let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+      calls
+        .iter()
+        .map(|call| RequestToolCall {
+          id: call.id.clone(),
+          call_type: "function".to_string(),
+          function: RequestToolFunction {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+          },
+        })
+        .collect()
+    });
+
+    // Build content based on message type and role
+    // - Tool messages: content is an array of text items
+    // - Assistant messages with tool_calls: content is null (but reasoning_content may be set)
+    // - Other messages: content is string or null
+    let (content, reasoning_content) = match msg.role {
+      Role::Tool => {
+        // Tool messages must use array format for content
+        let text = if msg.content.is_empty() {
+          "(Empty result)".to_string()
+        } else {
+          msg.content.clone()
+        };
+        let content_array = vec![ContentItem {
+          item_type: "text".to_string(),
+          text,
+        }];
+        (
+          Some(serde_json::to_value(content_array).unwrap_or(serde_json::Value::Null)),
+          None,
+        )
+      }
+      Role::Assistant if msg.tool_calls.is_some() => {
+        // Assistant messages with tool_calls:
+        // - content is null (not empty string, not array)
+        // - reasoning_content is passed through natively from the message field
+        (None, msg.reasoning_content.clone())
+      }
+      _ => {
+        // Other messages: content is string (or null if empty)
+        // reasoning_content is passed through natively for assistant messages
+        let content = if msg.content.is_empty() {
+          None
+        } else {
+          Some(serde_json::Value::String(msg.content.clone()))
+        };
+        let reasoning = msg.reasoning_content.clone();
+        (content, reasoning)
+      }
+    };
+
+    ChatMessage {
+      role: role.to_string(),
+      content,
+      tool_calls,
+      tool_call_id: msg.tool_call_id.clone(),
+      reasoning_content,
+    }
+  }
+
+  /// Convert tools to ToolDefinition format
+  fn convert_tools(tools: &[&Tool]) -> Vec<ToolDefinition> {
+    tools
+      .iter()
+      .map(|tool| ToolDefinition {
+        tool_type: "function".to_string(),
+        function: ToolFunction {
+          name: tool.name.clone(),
+          description: tool.description.clone(),
+          parameters: tool.parameters.clone(),
+        },
+      })
+      .collect()
+  }
+}
+
+#[async_trait]
+impl LLMProvider for ChatCompatProvider {
+  async fn chat_stream(
+    &self,
+    messages: Vec<Message>,
+  ) -> Result<crate::llm::provider::LlmResponseStream> {
+    use crate::error::Error;
+    use crate::llm::provider::LlmStreamEvent;
+    use futures::stream::{self, unfold};
+    use reqwest_eventsource::Event;
+
+    log::info!(
+      "ChatCompatProvider: Sending chat request with {} messages",
+      messages.len()
+    );
+    log::info!(
+      "ChatCompatProvider: Thinking mode enabled: {}",
+      self.config.enable_thinking
+    );
+
+    // Convert messages
+    let chat_messages: Vec<ChatMessage> = messages.iter().map(Self::convert_message).collect();
+
+    // Build request
+    let mut request = ChatCompletionRequest {
+      model: self.config.model.clone(),
+      messages: chat_messages,
+      max_tokens: self.config.max_tokens,
+      temperature: self.config.temperature,
+      stream: Some(true),
+      tools: None,
+      thinking: None,
+      stream_options: Some(StreamOptions {
+        include_usage: true,
+      }),
+    };
+
+    // Add thinking configuration if enabled
+    if self.config.enable_thinking {
+      request.thinking = Some(ThinkingConfig {
+        thinking_type: "enabled".to_string(),
+      });
+      log::info!("ChatCompatProvider: Added thinking config to request");
+    }
+
+    // Add tools if any
+    if !self.tool_registry.is_empty() {
+      let tools = self.tool_registry.all();
+      request.tools = Some(Self::convert_tools(&tools));
+      log::info!("ChatCompatProvider: Added {} tools to request", tools.len());
+    }
+
+    // Build URL
+    let url = format!("{}/chat/completions", self.base_url);
+    log::info!("ChatCompatProvider: Sending request to {}", url);
+
+    // Print request details
+    if let Ok(request_json) = to_string_pretty(&request) {
+      log::info!("ChatCompatProvider: Request body:\n{}", request_json);
+    }
+
+    // Send request with SSE
+    let event_source = self
+      .http_client
+      .post(&url)
+      .json(&request)
+      .eventsource()
+      .map_err(|_| {
+        LlmError::InvalidConfig(
+          "Failed to create event source: request is not cloneable".to_string(),
+        )
+      })?;
+
+    // Convert EventSource to a stream of LlmStreamEvent.
+    // Each SSE message may produce multiple events (thinking + content + tool_calls),
+    // so we use unfold to generate a sub-stream per message and flatten the result.
+    let stream = unfold(event_source, |mut es| async move {
+      loop {
+        match es.next().await {
+          Some(Ok(Event::Open)) => {
+            continue;
+          }
+          Some(Ok(Event::Message(message))) => {
+            log::debug!("ChatCompatProvider: Received SSE message: {}", message.data);
+            if message.data == "[DONE]" {
+              log::debug!("ChatCompatProvider: Received [DONE]");
+              return None;
+            }
+            match from_str::<ChatStreamResponse>(&message.data) {
+              Ok(kimi_response) => {
+                log::debug!(
+                  "ChatCompatProvider: Parsed Kimi response: id={}, model={}, choices={}",
+                  kimi_response.id,
+                  kimi_response.model,
+                  kimi_response.choices.len()
+                );
+                let mut events: Vec<std::result::Result<LlmStreamEvent, Error>> = Vec::new();
+                for (i, choice) in kimi_response.choices.iter().enumerate() {
+                  log::debug!(
+                    "ChatCompatProvider: Choice[{}]: content={:?}, reasoning_content={:?}, tool_calls={:?}",
+                    i,
+                    choice.delta.content,
+                    choice.delta.reasoning_content,
+                    choice.delta.tool_calls
+                  );
+                  if let Some(ref reasoning) = choice.delta.reasoning_content
+                    && !reasoning.is_empty()
+                  {
+                    events.push(Ok(LlmStreamEvent::Thinking(reasoning.clone())));
+                  }
+                  if let Some(ref content) = choice.delta.content
+                    && !content.is_empty()
+                  {
+                    events.push(Ok(LlmStreamEvent::Content(content.clone())));
+                  }
+                  if let Some(ref calls) = choice.delta.tool_calls {
+                    for call in calls {
+                      events.push(Ok(LlmStreamEvent::ToolCallChunk {
+                        index: call.index.unwrap_or(0),
+                        id: call.id.clone(),
+                        name: call.function.as_ref().and_then(|f| f.name.clone()),
+                        arguments: call.function.as_ref().and_then(|f| f.arguments.clone()),
+                      }));
+                    }
+                  }
+                }
+                if let Some(usage) = kimi_response.usage {
+                  events.push(Ok(LlmStreamEvent::from(usage)));
+                }
+                let sub = stream::iter(events);
+                return Some((sub, es));
+              }
+              Err(e) => {
+                log::error!("ChatCompatProvider: Failed to parse response: {}", e);
+                let sub = stream::iter(vec![Err(Error::Llm(LlmError::Stream {
+                  category: crate::error::StreamErrorCategory::Parse,
+                  status_code: None,
+                  message: format!("Failed to parse Kimi response: {}", e),
+                }))]);
+                return Some((sub, es));
+              }
+            }
+          }
+          Some(Err(e)) => {
+            log::error!("ChatCompatProvider: Event source error: {}", e);
+            let llm_err = classify_eventsource_stream_error(&e);
+            let sub = stream::iter(vec![Err(Error::Llm(llm_err))]);
+            return Some((sub, es));
+          }
+          None => {
+            log::debug!("ChatCompatProvider: Stream ended");
+            return None;
+          }
+        }
+      }
+    })
+    .flatten();
+
+    Ok(Box::pin(stream))
+  }
+
+  fn name(&self) -> &str {
+    "kimi"
+  }
+
+  fn max_context_size(&self) -> usize {
+    self.max_context_size
+  }
+
+  async fn on_retryable_error(&mut self, error: &LlmError) {
+    log::info!(
+      "ChatCompatProvider: Rebuilding HTTP client due to retryable error: {}",
+      error
+    );
+    match Self::create_http_client(&self.api_key, self.coding_agent) {
+      Ok(client) => {
+        self.http_client = client;
+        log::info!("ChatCompatProvider: HTTP client rebuilt successfully");
+      }
+      Err(e) => {
+        log::error!("ChatCompatProvider: Failed to rebuild HTTP client: {}", e);
+      }
+    }
+  }
+}
+
+/// Generate a pseudo-device ID based on hostname
+fn generate_device_id(hostname: &str) -> String {
+  let mut hasher = DefaultHasher::new();
+  hostname.hash(&mut hasher);
+  format!("{:016x}", hasher.finish())
+}
+
+/// Classify a `reqwest_eventsource::Error` from the streaming phase
+/// into a structured `LlmError` with precise error category.
+///
+/// Mirrors kimi-cli's error classification:
+/// - `InvalidStatusCode` ? `Stream::Http` (? kimi-cli's `APIStatusError`)
+/// - `Transport` + `is_timeout()` ? `Stream::Timeout` (? kimi-cli's `APITimeoutError`)
+/// - `Transport` + `is_connect()` ? `Stream::Disconnected` (? kimi-cli's `APIConnectionError`)
+/// - `Transport` other ? `Stream::Transport`
+/// - `Utf8` / `Parser` ? `Stream::Parse` (NOT retryable)
+fn classify_eventsource_stream_error(e: &EventSourceError) -> LlmError {
+  match e {
+    EventSourceError::InvalidStatusCode(code, _response) => LlmError::Stream {
+      category: StreamErrorCategory::Http,
+      status_code: Some(code.as_u16()),
+      message: format!("HTTP {} during stream", code),
+    },
+    EventSourceError::Transport(reqwest_err) => {
+      if reqwest_err.is_timeout() {
+        LlmError::Stream {
+          category: StreamErrorCategory::Timeout,
+          status_code: None,
+          message: format!("Stream timeout: {}", reqwest_err),
+        }
+      } else if reqwest_err.is_connect() {
+        LlmError::Stream {
+          category: StreamErrorCategory::Disconnected,
+          status_code: None,
+          message: format!("Connection lost: {}", reqwest_err),
+        }
+      } else {
+        LlmError::Stream {
+          category: StreamErrorCategory::Transport,
+          status_code: None,
+          message: format!("Transport error: {}", reqwest_err),
+        }
+      }
+    }
+    EventSourceError::Utf8(_) | EventSourceError::Parser(_) => LlmError::Stream {
+      category: StreamErrorCategory::Parse,
+      status_code: None,
+      message: format!("Parse error: {}", e),
+    },
+    _ => LlmError::Stream {
+      category: StreamErrorCategory::Transport,
+      status_code: None,
+      message: format!("Stream error: {}", e),
+    },
+  }
+}

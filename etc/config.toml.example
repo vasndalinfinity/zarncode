@@ -1,0 +1,290 @@
+# Zarncode Configuration Example
+# Copy this file to ~/.zarncode/config.toml or ./zarncode.toml
+
+# =============================================================================
+# Data Directory - Root directory for zarncode data files
+# =============================================================================
+
+# Data directory for zarncode files (logs, prompts, etc.)
+# If not specified, defaults to ~/.zarncode/
+# 
+# When specified, the following paths will be resolved relative to this directory:
+# - prompts/         : Directory containing system prompt templates
+# - logs/            : Directory containing log files
+#
+# Note: This config file itself should be located at either:
+# - ~/.zarncode/config.toml (default), or
+# - A location specified via -c/--config command line option
+#
+# dir = "~/.zarncode"
+
+# =============================================================================
+# Default Model - Which model to use by default
+# =============================================================================
+
+# Default model to use (must match a key in [models] section)
+# Format: "provider-name/model-name" or just "model-name"
+default_model = "openai/gpt-4o"
+
+# Default thinking mode - whether to use model's thinking capability by default
+# When true, models that support thinking (like kimi) will have thinking enabled
+# via the API's thinking parameter. The thinking content will be displayed
+# in the chat interface with a distinct style (grey italic).
+# Default: true
+default_thinking = true
+
+# =============================================================================
+# Providers - Define LLM API endpoints
+# A provider can be shared by multiple models
+# =============================================================================
+
+# All providers use OpenAI-compatible API
+# This includes OpenAI official, Azure OpenAI, Ollama, and other compatible providers
+
+[providers.openai]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+
+[providers.azure]
+type = "openai-compatible"
+base_url = "https://your-resource.openai.azure.com/openai/deployments"
+api_key = "${AZURE_OPENAI_API_KEY}"
+api_version = "2024-02-01"
+
+[providers.ollama]
+type = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+# No api_key needed for local Ollama
+
+[providers.siliconflow]
+type = "openai-compatible"
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "${SILICONFLOW_API_KEY}"
+
+[providers.deepseek]
+type = "openai-compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key = "${DEEPSEEK_API_KEY}"
+
+# =============================================================================
+# Models - Define available models and their settings
+# Each model references a provider by name
+# =============================================================================
+
+[models."openai/gpt-4o"]
+provider = "openai"
+model = "gpt-4o"
+max_context_size = 128000
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+supports_vision = true
+
+[models."openai/gpt-4o-mini"]
+provider = "openai"
+model = "gpt-4o-mini"
+max_context_size = 128000
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+supports_vision = true
+
+[models."azure/gpt-4"]
+provider = "azure"
+model = "gpt-4-deployment"
+max_context_size = 8192
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+
+[models."local/llama3.1"]
+provider = "ollama"
+model = "llama3.1"
+max_context_size = 128000
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+
+[models."siliconflow/deepseek-v3"]
+provider = "siliconflow"
+model = "zarnkina-deepseek-v4.1-flash-free"
+max_context_size = 64000
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+
+[models."deepseek/deepseek-chat"]
+provider = "deepseek"
+model = "deepseek-chat"
+max_context_size = 64000
+temperature = 0.7
+max_tokens = 4096
+supports_streaming = true
+
+# =============================================================================
+# Git Context - Auto-inject repository state into the system prompt
+# =============================================================================
+
+# When enabled, Zarncode detects the git repository containing the working
+# directory and appends a concise repository snapshot to the system prompt.
+# The snapshot is refreshed at session start and after any mutating tool call.
+
+[git_context]
+# Whether git context injection is enabled.
+# Default: true
+enabled = true
+
+# Per-command timeout when running git commands.
+# Default: 5 seconds
+timeout_seconds = 5
+
+# Maximum number of dirty files listed before truncating.
+# Default: 20
+max_dirty_files = 20
+
+# Maximum number of recent commits included in the snapshot.
+# Default: 20
+max_log_commits = 20
+
+# Maximum number of branches listed before truncating.
+# Default: 20
+max_branches = 20
+
+# Maximum number of lines for each diff stat block.
+# Default: 50
+max_diff_stat_lines = 50
+
+# =============================================================================
+# Compaction - Automatic context compression settings
+# =============================================================================
+
+# Controls when and how the conversation context is automatically compacted
+# to prevent exceeding the model's context window limits.
+
+[compaction]
+# Whether automatic compaction is enabled.
+# When true, compaction will trigger automatically when token limits are approached.
+# Default: true
+enabled = true
+
+# Context usage ratio threshold (0.5 - 0.99) for triggering auto-compaction.
+# Auto-compaction triggers when:
+#   current_tokens >= max_context_size * trigger_ratio
+# OR
+#   current_tokens + reserved_context_size >= max_context_size
+# Default: 0.85 (85%)
+trigger_ratio = 0.85
+
+# Reserved token count for LLM response generation.
+# This ensures enough headroom for the model to generate a response after compaction.
+# Default: 50000
+reserved_context_size = 50000
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+[logging]
+level = "info"        # Options: "trace", "debug", "info", "warn", "error"
+
+# Logs are always written to ${dir}/logs/zarncode.log
+# where ${dir} is the data directory specified above (defaults to ~/.zarncode/)
+#
+# To output logs to stderr instead of file, set the RUST_LOG environment variable:
+#   RUST_LOG=debug zarncode
+
+# =============================================================================
+# MCP (Model Context Protocol) Servers
+# =============================================================================
+#
+# MCP allows zarncode to connect to external tool servers.
+# Configuration is compatible with kimi-cli's MCP format.
+#
+# You can define servers inline in this TOML file, or reference an external
+# JSON config file (e.g. one shared with kimi-cli or Claude Desktop).
+
+[mcp]
+# Optional: load servers from an external JSON file (kimi-cli compatible format)
+# config_file = "~/.zarncode/mcp.json"
+
+# Example: HTTP-based MCP server
+# [mcp.servers.context7]
+# transport = "http"
+# url = "https://mcp.context7.com/mcp"
+# headers = { CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}" }
+
+# Example: stdio-based MCP server (spawns a subprocess)
+# [mcp.servers.chrome-devtools]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "chrome-devtools-mcp@latest"]
+# env = { SOME_VAR = "value" }
+
+# Per-server options:
+# - disabled = false         # Temporarily disable this server
+# - auto_approve = []        # List of tool names to auto-approve
+
+# =============================================================================
+# Zarnkina Relay - account, session, and local quota
+# =============================================================================
+#
+# Sign in once:
+#   zarncode auth login            # browser (Google)
+#   zarncode auth login --api-key zk_live_...
+#   zarncode auth status
+#   zarncode quota [--reset]
+#   zarncode models
+#
+# Credential precedence: environment (ZARNKINA_API_KEY / ZARNKINA_EMAIL /
+# ZARNKINA_SESSION_TOKEN), then this file, then ~/.zarncode/auth.json, then the
+# desktop client's %APPDATA%/Zarnkina/auth.json.
+
+[providers.zarnkina]
+type = "zarnkina"
+base_url = "https://zarnkina-relay.hostless.app"
+# Leave api_key unset to use the session token from `zarncode auth login`.
+# api_key = "${ZARNKINA_API_KEY}"
+# email = "you@example.com"
+
+[models."zarnkina/glm-5.3-flash"]
+provider = "zarnkina"
+model = "zarnkina-glm-5.3-flash"
+max_context_size = 1048576
+max_tokens = 131072
+
+[models."zarnkina/glm-5.3"]
+provider = "zarnkina"
+model = "zarnkina-glm-5.3"
+max_context_size = 1048576
+max_tokens = 32768
+
+[models."zarnkina/deepseek-v4.1"]
+provider = "zarnkina"
+model = "zarnkina-deepseek-v4.1-flash"
+max_context_size = 1048576
+max_tokens = 32768
+
+[models."zarnkina/deepseek-v4-pro"]
+provider = "zarnkina"
+model = "zarnkina-deepseek-v4-pro"
+max_context_size = 1048576
+max_tokens = 32768
+
+[models."zarnkina/minimax-m3.1-flash"]
+provider = "zarnkina"
+model = "zarnkina-minimax-m3.1-flash"
+max_context_size = 1000000
+max_tokens = 131072
+
+[models."zarnkina/beam-1.0"]
+provider = "zarnkina"
+model = "zarnkina-beam-1.0"
+max_context_size = 1048576
+max_tokens = 32768
+
+[quota]
+# Refuse a turn when the local 5h/weekly ledger is exhausted.
+enforce = true
+# Ask the relay whether the account and model may be used before a turn.
+verify_account = true

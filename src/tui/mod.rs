@@ -1,0 +1,148 @@
+//! Terminal UI infrastructure.
+//!
+//! Provides the building blocks for an async event-driven terminal interface,
+//! including frame scheduling and unified event handling.
+
+use std::io::{Stdout, stdout};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, KeyEvent, MouseEvent};
+use crossterm::execute;
+use crossterm::terminal::{
+  EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use tokio::sync::broadcast;
+
+use crate::error::{Result, TuiError};
+
+mod event_stream;
+mod frame_rate_limiter;
+mod frame_requester;
+mod message;
+mod message_broker;
+
+pub use event_stream::TuiEventBroker;
+pub use event_stream::TuiEventStream;
+pub use frame_requester::FrameRequester;
+// pub use message::UiMessage;  // Currently unused
+// pub use message_broker::MessageBroker;  // Currently unused
+
+/// Target frame interval for UI redraw scheduling (120 FPS max).
+pub const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
+
+/// Events that can be processed by the TUI event loop.
+#[derive(Debug, Clone)]
+pub enum TuiEvent {
+  /// A keyboard event.
+  Key(KeyEvent),
+  /// A mouse event (wheel scrolling, clicks).
+  Mouse(MouseEvent),
+  /// A request to redraw the UI.
+  Draw,
+  /// Text pasted into the terminal.
+  Paste(String),
+}
+
+/// The TUI instance, holding the terminal and frame scheduling infrastructure.
+pub struct Tui {
+  terminal: Terminal<CrosstermBackend<Stdout>>,
+  frame_requester: FrameRequester,
+  draw_tx: broadcast::Sender<()>,
+  event_broker: Arc<TuiEventBroker>,
+  terminal_focused: Arc<AtomicBool>,
+}
+
+impl Tui {
+  /// Create a new TUI instance.
+  pub fn new() -> Result<Self> {
+    let terminal = Terminal::new(CrosstermBackend::new(stdout()))
+      .map_err(|e| TuiError::CreateBackend { source: e })?;
+    let event_broker = Arc::new(TuiEventBroker::new());
+    let terminal_focused = Arc::new(AtomicBool::new(true));
+
+    // Create a broadcast channel for draw events
+    let (draw_tx, _draw_rx) = broadcast::channel(16);
+    let frame_requester = FrameRequester::new(draw_tx.clone());
+
+    Ok(Self {
+      terminal,
+      frame_requester,
+      draw_tx,
+      event_broker,
+      terminal_focused,
+    })
+  }
+
+  /// Get a clone of the frame requester handle.
+  pub fn frame_requester(&self) -> FrameRequester {
+    self.frame_requester.clone()
+  }
+
+  /// Create a new event stream for polling TUI events.
+  pub fn create_event_stream(&self) -> TuiEventStream {
+    TuiEventStream::new(
+      self.event_broker.clone(),
+      self.draw_tx.subscribe(),
+      self.terminal_focused.clone(),
+    )
+  }
+
+  /// Draw the UI using the provided function.
+  pub fn draw<F>(&mut self, f: F) -> Result<()>
+  where
+    F: FnOnce(&mut ratatui::Frame),
+  {
+    self
+      .terminal
+      .draw(f)
+      .map_err(|e| TuiError::DrawFrame { source: e })?;
+    Ok(())
+  }
+}
+
+/// Initialize the terminal for TUI mode.
+pub fn init_terminal() -> Result<()> {
+  enable_raw_mode().map_err(|e| TuiError::InitTerminal { source: e })?;
+  execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+    .map_err(|e| TuiError::InitTerminal { source: e })?;
+  Ok(())
+}
+
+/// Restore the terminal to normal mode.
+pub fn restore_terminal() -> Result<()> {
+  execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)
+    .map_err(|e| TuiError::RestoreTerminal { source: e })?;
+  disable_raw_mode().map_err(|e| TuiError::RestoreTerminal { source: e })?;
+  Ok(())
+}
+
+/// Restore raw mode and the alternate screen on every return path, including errors.
+pub struct TerminalGuard {
+  active: bool,
+}
+
+impl TerminalGuard {
+  pub fn enter() -> Result<Self> {
+    let guard = Self { active: true };
+    init_terminal()?;
+    Ok(guard)
+  }
+
+  pub fn restore(&mut self) -> Result<()> {
+    if self.active {
+      restore_terminal()?;
+      self.active = false;
+    }
+    Ok(())
+  }
+}
+
+impl Drop for TerminalGuard {
+  fn drop(&mut self) {
+    let _ = self.restore();
+  }
+}

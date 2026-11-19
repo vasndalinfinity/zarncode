@@ -1,0 +1,3093 @@
+//! Chat session management module (Actor pattern).
+//!
+//! Manages a conversation with an LLM using the actor pattern.
+//! The session runs in a dedicated tokio task and communicates via channels.
+
+use std::env;
+use std::future::pending;
+use std::mem;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::Local;
+use log::{debug, error, info, warn};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use super::approval::{ApprovalDecision, ApprovalService};
+use super::compaction::CompactionService;
+use super::plan_injection::PlanModeInjectionState;
+use super::state::ActorState;
+use crate::approval::ApprovalResult;
+use crate::cli::runtime::Runtime;
+use crate::error::Result;
+use crate::hooks::{HookDecision, HookEventType, events as hook_events};
+use crate::llm::provider::LLMProvider;
+use crate::llm::types::{Message, ToolCall};
+use crate::notification::llm::{
+  build_notification_message, extract_notification_ids, is_notification_message,
+};
+use crate::session::{SessionMeta, SessionMode, SessionStore};
+use crate::subagents::ToolPolicy;
+use crate::utils::plan::{get_or_create_slug, plan_file_path, read_plan, seed_slug_cache};
+use crate::utils::token_counter::estimate_llm_messages_tokens;
+
+/// Default maximum steps per turn to prevent infinite tool-call loops.
+pub(crate) const DEFAULT_MAX_STEPS_PER_TURN: usize = 10;
+
+/// Tracks whether the actor is running inside an explicit agent loop.
+#[derive(Debug, Clone, Copy)]
+enum AgentLoopState {
+  /// No agent loop is active.
+  Idle,
+  /// Inside a turn loop; `step_count` is the number of LLM calls made so far.
+  InProgress { step_count: usize },
+}
+
+/// Generate a collision-resistant ID that is a valid directory name on every platform.
+pub(crate) fn generate_session_id() -> String {
+  let name = env::current_dir()
+    .ok()
+    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+    .unwrap_or_else(|| "workspace".into());
+  let name: String = name
+    .chars()
+    .take(48)
+    .map(|c| {
+      if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+        c
+      } else {
+        '-'
+      }
+    })
+    .collect();
+  format!(
+    "{}-{}-{}",
+    name,
+    Local::now().format("%Y%m%d-%H%M%S"),
+    uuid::Uuid::new_v4().simple()
+  )
+}
+
+use super::context::Context;
+use super::persistence::SessionPersistence;
+use super::stream::{StreamManager, format_user_friendly_error};
+use super::tool_exec::{ToolExecutionContext, ToolExecutor};
+use super::{Question, QuestionOption, SessionCommand, SessionEvent, SessionHandle};
+use crate::notification::NotificationManager;
+use crate::wire::{WireMessage, WirePublisher};
+
+/// Acknowledge any notification IDs embedded in the given messages.
+///
+/// Used on session resume to avoid redelivering notifications that are already
+/// part of the persisted context. Mirrors the reference CLI's `extract_notification_ids`.
+fn ack_notification_ids_in_context(manager: &NotificationManager, messages: &[Message]) {
+  for msg in messages {
+    if msg.role != crate::llm::types::Role::User {
+      continue;
+    }
+    if !is_notification_message(&msg.content) {
+      continue;
+    }
+    for id in extract_notification_ids(&msg.content) {
+      manager.ack("llm", &id);
+    }
+  }
+}
+
+/// Configuration for constructing a SessionActor.
+struct SessionActorConfig {
+  /// Session or agent instance id.
+  id: String,
+  /// LLM provider.
+  provider: Box<dyn LLMProvider>,
+  /// Initial messages (including system prompt).
+  messages: Vec<Message>,
+  /// Wire publisher for outgoing events.
+  wire_publisher: WirePublisher,
+  /// Command receiver.
+  cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
+  /// Optional session store for persistence. None for in-memory subagents.
+  session_store: Option<Arc<SessionStore>>,
+  /// Session metadata.
+  meta: SessionMeta,
+  /// Runtime context.
+  runtime: Arc<Runtime>,
+  /// Tool policy for subagents. None for root agents.
+  tool_policy: Option<ToolPolicy>,
+}
+
+/// Internal state of the session actor
+struct SessionActor {
+  steering_already_delivered: bool,
+  turn_failed: bool,
+  /// Session ID
+  id: String,
+  /// Message history managed by Context
+  context: Context,
+  /// Wire publisher for sending events to the UI layer
+  wire_publisher: WirePublisher,
+  /// Channel to receive commands
+  cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
+  /// Current response being accumulated
+  current_response: String,
+  /// Current thinking content being accumulated
+  current_thinking: String,
+  /// Event receiver for the current stream (if any)
+  stream_rx: Option<mpsc::UnboundedReceiver<SessionEvent>>,
+  /// Receiver for an in-flight approval request.
+  approval_rx: Option<tokio::sync::oneshot::Receiver<crate::approval::ApprovalResult>>,
+  /// Stream manager for LLM streaming with retry
+  stream_manager: StreamManager,
+  /// Tool call buffer for accumulating tool calls during streaming
+  pending_tool_calls: Vec<ToolCall>,
+  /// Precise token count from API usage (if available)
+  precise_token_count: Option<u32>,
+  /// Buffered persistence layer
+  persistence: SessionPersistence,
+  /// Session metadata for persistence
+  meta: SessionMeta,
+  /// Maximum context size for the current model (read from global config at creation)
+  max_context_size: usize,
+  /// Tool executor for dispatching and previewing tool calls
+  tool_executor: ToolExecutor,
+  /// Approval policy service for tool call decisions
+  approval_service: ApprovalService,
+  /// Compaction monitoring and execution service
+  compaction_service: CompactionService,
+  /// Runtime context (config, tool registries, etc.)
+  #[allow(dead_code)]
+  runtime: Arc<Runtime>,
+  /// Explicit actor state replacing is_streaming + tool_call_execution_state + pending_answers_state
+  state: ActorState,
+  /// Agent loop state — tracks whether we're in an explicit turn loop and step count.
+  agent_loop_state: AgentLoopState,
+  /// Maximum steps (LLM calls) allowed per turn to prevent infinite loops.
+  max_steps_per_turn: usize,
+  /// Whether plan mode is active (read-only tools only).
+  plan_mode: bool,
+  /// Stable identifier for the current planning session.
+  plan_session_id: Option<String>,
+  /// Dynamic plan-mode reminder injection state.
+  plan_injection_state: PlanModeInjectionState,
+  /// Guard to prevent recursive Stop hook re-triggering.
+  stop_hook_active: bool,
+  /// Whether this actor is running a subagent session.
+  is_subagent: bool,
+}
+
+impl SessionActor {
+  fn new(config: SessionActorConfig) -> Self {
+    let SessionActorConfig {
+      id,
+      provider,
+      messages,
+      wire_publisher,
+      cmd_rx,
+      session_store,
+      mut meta,
+      runtime,
+      tool_policy,
+    } = config;
+
+    let max_context_size = provider.max_context_size();
+    // YOLO is a per-run grant only. It used to be read back from the session
+    // meta, so a session that had once been yolo kept auto-approving every tool
+    // on later `--continue` runs without asking.
+    let yolo = runtime.yolo();
+    let is_subagent = session_store.is_none() || !runtime.role.is_root();
+    let plan_mode = if is_subagent { false } else { meta.plan_mode };
+    let plan_session_id = if is_subagent {
+      None
+    } else {
+      meta.plan_session_id.clone()
+    };
+
+    // Pre-warm the slug cache so the persisted slug survives process restarts.
+    if let (Some(psid), Some(slug)) = (&plan_session_id, &meta.plan_slug) {
+      seed_slug_cache(psid, slug);
+    }
+
+    // Ack any notification IDs that are already present in the resumed
+    // context so they are not redelivered to the LLM.
+    // This mirrors the reference CLI's extract_notification_ids behaviour.
+    if !is_subagent {
+      ack_notification_ids_in_context(&runtime.notification_manager(), &messages);
+    }
+
+    meta.input_queue.recover(&messages);
+    let persistence = match session_store {
+      Some(store) => SessionPersistence::new(store),
+      None => SessionPersistence::new_in_memory(),
+    };
+
+    let max_steps_per_turn = runtime.max_steps;
+    Self {
+      steering_already_delivered: false,
+      turn_failed: false,
+      id: id.clone(),
+      context: Context::from_messages(messages),
+      wire_publisher,
+      cmd_rx,
+      current_response: String::new(),
+      current_thinking: String::new(),
+      stream_rx: None,
+      approval_rx: None,
+      stream_manager: StreamManager::new(provider, runtime.retry_config()),
+      pending_tool_calls: Vec::new(),
+      precise_token_count: None,
+      persistence,
+      meta,
+      max_context_size,
+      tool_executor: {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut executor = ToolExecutor::new(
+          cwd.clone(),
+          runtime.executable_registry.clone(),
+          runtime.hook_engine(),
+        );
+        executor.bind_context(ToolExecutionContext {
+          session_id: id.clone(),
+          cwd,
+        });
+        executor.set_tool_policy(ToolPolicy {
+          mode: crate::subagents::ToolPolicyMode::Allowlist,
+          tools: runtime
+            .tool_registry
+            .all()
+            .iter()
+            .filter(|tool| {
+              tool_policy
+                .as_ref()
+                .is_none_or(|policy| policy.allows(&tool.name))
+            })
+            .map(|tool| tool.name.clone())
+            .filter(|name| !is_subagent || (name != "Agent" && name != "Task"))
+            .collect(),
+        });
+        executor
+      },
+      approval_service: ApprovalService::new(yolo, runtime.auto_approve()),
+      compaction_service: CompactionService::new(runtime.compaction_config().clone()),
+      runtime,
+      state: ActorState::Idle,
+      agent_loop_state: AgentLoopState::Idle,
+      max_steps_per_turn,
+      plan_mode,
+      plan_session_id,
+      plan_injection_state: {
+        let mut state = PlanModeInjectionState::default();
+        if plan_mode {
+          state.schedule_activation();
+        }
+        state
+      },
+      stop_hook_active: false,
+      is_subagent,
+    }
+  }
+
+  /// Main actor loop
+  async fn run(mut self) {
+    info!("SessionActor {} started", self.id);
+
+    self.publish_input_queue();
+    loop {
+      tokio::select! {
+        biased;
+        // Process incoming commands
+        Some(cmd) = self.cmd_rx.recv() => {
+          if !self.handle_command(cmd).await {
+            break;
+          }
+        }
+
+        // Process streaming events if active
+        Some(event) = async {
+          match &mut self.stream_rx {
+            Some(rx) => rx.recv().await,
+            None => pending().await,
+          }
+        } => {
+          self.handle_stream_event(event).await;
+        }
+
+        // Process approval responses if a request is in flight
+        Some(result) = async {
+          match &mut self.approval_rx {
+            Some(rx) => rx.await.ok(),
+            None => pending().await,
+          }
+        } => {
+          self.approval_rx = None;
+          self.handle_approval_result(result).await;
+        }
+
+        // If no streaming and channel closed, exit
+        else => {
+          if self.stream_rx.is_none() {
+            info!("SessionActor {}: command channel closed, exiting", self.id);
+            break;
+          }
+        }
+      }
+      self.drain_ready_inputs().await;
+    }
+
+    info!("SessionActor {} stopped", self.id);
+  }
+
+  /// Trigger `Notification` hooks for notifications delivered to a sink.
+  fn run_notification_hooks(&self, sink: &str, views: &[crate::notification::NotificationView]) {
+    for view in views {
+      let _handle = self.runtime.hook_engine().trigger_fire_and_forget(
+        HookEventType::Notification,
+        view.event.event_type.clone(),
+        hook_events::notification(
+          &self.id,
+          &self.runtime.args.work_dir,
+          sink,
+          &view.event.event_type,
+          &view.event.title,
+          &view.event.body,
+          &format!("{:?}", view.event.severity).to_lowercase(),
+        ),
+      );
+    }
+  }
+
+  /// Trigger `StopFailure` hook when graceful turn execution fails.
+  fn run_stop_failure_hook(&self, error_type: &str, error_message: &str) {
+    let _handle = self.runtime.hook_engine().trigger_fire_and_forget(
+      HookEventType::StopFailure,
+      error_type.to_string(),
+      hook_events::stop_failure(
+        &self.id,
+        &self.runtime.args.work_dir,
+        error_type,
+        error_message,
+      ),
+    );
+  }
+
+  /// Trigger `UserPromptSubmit` hooks.
+  ///
+  /// Returns `Some(reason)` if any hook blocked the prompt, or `None` if the
+  /// prompt should proceed.
+  async fn run_user_prompt_submit_hook(&self, content: &str) -> Option<String> {
+    let results = self
+      .runtime
+      .hook_engine()
+      .trigger(
+        HookEventType::UserPromptSubmit,
+        content,
+        hook_events::user_prompt_submit(&self.id, &self.runtime.args.work_dir, content),
+      )
+      .await;
+
+    for result in results {
+      if let HookDecision::Block { reason } = result.decision {
+        return Some(if reason.is_empty() {
+          "Prompt blocked by hook.".to_string()
+        } else {
+          reason
+        });
+      }
+    }
+
+    None
+  }
+
+  fn publish_input_queue(&self) {
+    self.wire_publisher.send(WireMessage::InputQueueChanged {
+      queue: self.meta.input_queue.clone(),
+    });
+  }
+
+  fn save_input_queue(&mut self) -> bool {
+    self.meta.updated_at = Local::now();
+    self.persistence.stage_meta(&self.meta);
+    let saved = match self.persistence.flush() {
+      Ok(()) => true,
+      Err(error) => {
+        self.meta.input_queue.paused = true;
+        self.wire_publisher.send(WireMessage::Text {
+          text: format!("Input queue paused: could not persist it: {error}"),
+        });
+        false
+      }
+    };
+    self.publish_input_queue();
+    saved
+  }
+
+  fn enqueue_input(
+    &mut self,
+    id: String,
+    kind: super::input_queue::InputKind,
+    content: String,
+  ) -> bool {
+    if let Err(reason) = self.meta.input_queue.enqueue(id, kind, content) {
+      self.wire_publisher.send(WireMessage::Text { text: reason });
+      return false;
+    }
+    self.save_input_queue()
+  }
+
+  fn input_delivery_failed(&mut self, reason: String) {
+    self.turn_failed = true;
+    self.meta.input_queue.paused = true;
+    self.save_input_queue();
+    self
+      .wire_publisher
+      .send(WireMessage::Error { message: reason });
+  }
+  async fn accept_queued_input(
+    &mut self,
+    input: super::input_queue::QueuedInput,
+    new_task: bool,
+  ) -> bool {
+    let existing = input
+      .delivery_index
+      .and_then(|i| {
+        self
+          .context
+          .messages()
+          .iter()
+          .filter(|m| m.role == crate::llm::types::Role::User)
+          .nth(i)
+      })
+      .filter(|m| m.content == input.content)
+      .cloned();
+    let durable = if let (Some(_), Some(index)) = (&existing, input.delivery_index) {
+      match self
+        .persistence
+        .user_delivery_persisted(&self.id, index, &input.content)
+      {
+        Ok(durable) => durable,
+        Err(error) => {
+          self.input_delivery_failed(format!("Could not verify prepared input: {error}"));
+          return false;
+        }
+      }
+    } else {
+      false
+    };
+    if existing.is_none()
+      && let Some(reason) = self.run_user_prompt_submit_hook(&input.content).await
+    {
+      self.meta.input_queue.paused = true;
+      self.save_input_queue();
+      if new_task {
+        self.wire_publisher.send(WireMessage::TurnBegin);
+        self
+          .wire_publisher
+          .send(WireMessage::ContentChunk { text: reason });
+        self.wire_publisher.send(WireMessage::TurnEnd);
+        self
+          .wire_publisher
+          .send(WireMessage::TurnComplete { blocked: true });
+      } else {
+        self.wire_publisher.send(WireMessage::Text {
+          text: format!("Steering blocked; queue paused: {reason}"),
+        });
+      }
+      return false;
+    }
+    if !durable {
+      let message = if let Some(message) = existing {
+        message
+      } else {
+        let index = self
+          .context
+          .messages()
+          .iter()
+          .filter(|m| m.role == crate::llm::types::Role::User)
+          .count();
+        if let Some(entry) = self
+          .meta
+          .input_queue
+          .entries
+          .iter_mut()
+          .find(|e| e.id == input.id)
+        {
+          entry.delivery_index = Some(index);
+        }
+        if !self.save_input_queue() {
+          self.input_delivery_failed("Could not prepare queued input".into());
+          return false;
+        }
+        self.context.push_user(&input.content).clone()
+      };
+      self.meta.update_title_from_message(&message);
+      self.persistence.stage_message(&self.id, &message);
+      if let Err(error) = self.persistence.flush() {
+        self.input_delivery_failed(format!("Could not persist queued input: {error}"));
+        return false;
+      }
+    }
+    let backup = self.meta.input_queue.clone();
+    self.meta.input_queue.remove(&input.id);
+    if !self.save_input_queue() {
+      self.meta.input_queue = backup;
+      self.input_delivery_failed("Could not commit queued input delivery".into());
+      return false;
+    }
+    self.current_response.clear();
+    self.current_thinking.clear();
+    self.pending_tool_calls.clear();
+    self.precise_token_count = None;
+    self.wire_publisher.send(WireMessage::InputDelivered {
+      id: input.id,
+      kind: input.kind,
+      content: input.content,
+    });
+    true
+  }
+
+  async fn drain_ready_inputs(&mut self) {
+    if matches!(self.state, ActorState::Idle)
+      && matches!(self.agent_loop_state, AgentLoopState::Idle)
+      && !self.turn_failed
+      && let Some(input) = self.meta.input_queue.next(false)
+      && self.accept_queued_input(input, true).await
+    {
+      self.start_turn().await;
+    }
+  }
+
+  fn cancel_pending_input_work(&mut self) {
+    self.meta.input_queue.paused = true;
+    self.stop_hook_active = false;
+    self.steering_already_delivered = false;
+    self.turn_failed = false;
+    self.stream_rx = None;
+    self.approval_rx = None;
+    self.state = ActorState::Idle;
+    self.agent_loop_state = AgentLoopState::Idle;
+    self.current_response.clear();
+    self.current_thinking.clear();
+    self.pending_tool_calls.clear();
+    // Preserve tool-call pairing without claiming cancelled work was executed.
+    let mut pending = Vec::new();
+    for message in self.context.messages() {
+      if let Some(calls) = &message.tool_calls {
+        pending.extend(calls.iter().map(|call| call.id.clone()));
+      }
+      if let Some(id) = &message.tool_call_id {
+        pending.retain(|pending_id| pending_id != id);
+      }
+    }
+    for id in pending {
+      self.context.push_tool_result(
+        id,
+        "Cancelled before a result was recorded; execution may have been interrupted.",
+      );
+      let message = self.context.messages().last().unwrap().clone();
+      self.persistence.stage_message(&self.id, &message);
+    }
+    self.runtime.approval_runtime().reject_source(&self.id);
+    self.save_input_queue();
+    self.wire_publisher.send(WireMessage::TurnCancelled);
+  }
+
+  /// Handle a command from the handle
+  /// Returns false if the actor should shutdown
+  async fn handle_command(&mut self, cmd: SessionCommand) -> bool {
+    match cmd {
+      SessionCommand::StartExistingContext => {
+        if self.is_subagent
+          && matches!(self.state, ActorState::Idle)
+          && matches!(self.agent_loop_state, AgentLoopState::Idle)
+        {
+          self.start_turn().await;
+        }
+        true
+      }
+      SessionCommand::SendMessage { content } => {
+        if self
+          .meta
+          .input_queue
+          .entries
+          .iter()
+          .any(|e| e.delivery_index.is_some())
+        {
+          self.enqueue_input(
+            uuid::Uuid::new_v4().to_string(),
+            super::input_queue::InputKind::FollowUp,
+            content,
+          );
+          self.meta.input_queue.paused = true;
+          self.save_input_queue();
+          self.wire_publisher.send(WireMessage::Error { message: "A prepared input needs recovery. Resume the queue or clear context before starting another task.".into() });
+          return true;
+        }
+        let idle = matches!(self.state, ActorState::Idle)
+          && matches!(self.agent_loop_state, AgentLoopState::Idle);
+        let id = uuid::Uuid::new_v4().to_string();
+        if self.enqueue_input(id.clone(), super::input_queue::InputKind::FollowUp, content) {
+          if idle {
+            let input = self
+              .meta
+              .input_queue
+              .entries
+              .iter()
+              .find(|e| e.id == id)
+              .unwrap()
+              .clone();
+            if self.accept_queued_input(input, true).await {
+              self.start_turn().await;
+            }
+          }
+        } else if idle {
+          self.wire_publisher.send(WireMessage::Error {
+            message: "Input was not started; inspect the paused input queue".into(),
+          });
+        }
+        true
+      }
+      SessionCommand::EnqueueInput { id, kind, content } => {
+        self.enqueue_input(id, kind, content);
+        true
+      }
+      SessionCommand::InspectInputQueue => {
+        self.publish_input_queue();
+        let mut text = format!(
+          "Input queue{}",
+          if self.meta.input_queue.paused {
+            " (paused)"
+          } else {
+            ""
+          }
+        );
+        for input in &self.meta.input_queue.entries {
+          text.push_str(&format!(
+            "\n{} {:?}: {}",
+            input.id, input.kind, input.content
+          ));
+        }
+        if self.meta.input_queue.entries.is_empty() {
+          text.push_str(" is empty");
+        }
+        self.wire_publisher.send(WireMessage::Text { text });
+        true
+      }
+      SessionCommand::EditQueuedInput { id, content } => {
+        if let Err(text) = self.meta.input_queue.edit(&id, content) {
+          self.wire_publisher.send(WireMessage::Text { text });
+        } else {
+          self.save_input_queue();
+        }
+        true
+      }
+      SessionCommand::RemoveQueuedInput { id } => {
+        if let Some(full) = self.meta.input_queue.resolve_id(&id)
+          && self
+            .meta
+            .input_queue
+            .entries
+            .iter()
+            .any(|e| e.id == full && e.delivery_index.is_some())
+        {
+          self.wire_publisher.send(WireMessage::Text { text: "This input is already prepared. Resume its delivery or clear context before removing it.".into() });
+          return true;
+        }
+        if self.meta.input_queue.remove(&id).is_none() {
+          self.wire_publisher.send(WireMessage::Text {
+            text: "Queued input id not found".into(),
+          });
+        } else {
+          self.save_input_queue();
+        }
+        true
+      }
+      SessionCommand::PauseInputQueue { paused } => {
+        self.meta.input_queue.paused = paused;
+        if !paused {
+          self.turn_failed = false;
+        }
+        self.save_input_queue();
+        true
+      }
+      SessionCommand::Cancel => {
+        self.cancel_pending_input_work();
+        true
+      }
+
+      SessionCommand::AllowToolForSession { name } => {
+        self.approval_service.allow_tool(&name);
+        info!("Session {}: auto-approving '{}' for this session", self.id, name);
+        true
+      }
+
+      SessionCommand::SwitchModel { alias } => {
+        match crate::llm::factory::build_provider(&self.runtime, Some(&alias)) {
+          Ok(provider) => {
+            let max_context_size = provider.max_context_size();
+            self.stream_manager.set_provider(provider);
+            self.max_context_size = max_context_size;
+            if let Ok(mut guard) = self.runtime.active_model.lock() {
+              *guard = Some(alias.clone());
+            }
+            info!("Session {}: switched model to {}", self.id, alias);
+            true
+          }
+          Err(error) => {
+            let message = format!("Could not switch to '{alias}': {error}");
+            self
+              .wire_publisher
+              .send(crate::wire::protocol::WireMessage::Error { message });
+            false
+          }
+        }
+      }
+
+      SessionCommand::ClearHistory => {
+        info!("Session {}: Clearing history", self.id);
+        self.cancel_pending_input_work();
+        self.context.clear_non_system();
+        for entry in &mut self.meta.input_queue.entries {
+          entry.delivery_index = None;
+        }
+
+        self.meta.updated_at = Local::now();
+        self
+          .persistence
+          .reset_messages(&self.id, self.context.messages());
+        self.persistence.stage_meta(&self.meta);
+        let _ = self.persistence.flush();
+
+        self.current_response.clear();
+        self.current_thinking.clear();
+        self.pending_tool_calls.clear();
+        if matches!(self.state, ActorState::Streaming) {
+          self.stream_rx = None;
+          self.state = ActorState::Idle;
+        }
+        true
+      }
+
+      SessionCommand::ApproveToolCall {
+        tool_call_id,
+        approved,
+        reject_remaining,
+      } => {
+        self
+          .handle_approval(tool_call_id, approved, reject_remaining)
+          .await;
+        true
+      }
+
+      SessionCommand::AnswerQuestions {
+        tool_call_id,
+        answers,
+        dismissed,
+      } => {
+        match &self.state {
+          ActorState::WaitingEnterPlanMode { .. } => {
+            self
+              .handle_plan_mode_enter_answer(tool_call_id, answers, dismissed)
+              .await;
+          }
+          ActorState::WaitingExitPlanMode { .. } => {
+            self
+              .handle_plan_mode_exit_answer(tool_call_id, answers, dismissed)
+              .await;
+          }
+          _ => {
+            self
+              .handle_question_answers(tool_call_id, answers, dismissed)
+              .await;
+          }
+        }
+        true
+      }
+
+      SessionCommand::EnableSessionYolo => {
+        info!("Session {}: Enabling YOLO mode for this session", self.id);
+        // Deliberately not staged into meta: the grant dies with the process.
+        self.approval_service.set_yolo(true);
+        true
+      }
+
+      SessionCommand::PlanSlashCommand { subcmd } => {
+        self.handle_plan_slash_command(&subcmd).await;
+        true
+      }
+
+      SessionCommand::Shutdown => {
+        info!("Session {}: Shutdown requested", self.id);
+        self.wire_publisher.send(WireMessage::Error {
+          message: "Session shutdown".to_string(),
+        });
+        false
+      }
+    }
+  }
+
+  /// Check if compaction is needed and send notification if so.
+  async fn check_and_notify_compaction(&mut self) {
+    // Estimate current token count
+    let current_tokens = if let Some(precise) = self.precise_token_count {
+      let recent_tokens = estimate_llm_messages_tokens(
+        &self.context.messages()[self.context.len().saturating_sub(2)..],
+      );
+      precise as usize + recent_tokens
+    } else {
+      self.context.estimate_tokens()
+    };
+
+    if let Some(trigger) = self
+      .compaction_service
+      .check(current_tokens, self.max_context_size)
+    {
+      info!(
+        "Session {}: Compaction needed - {} tokens (threshold: {})",
+        self.id, trigger.current_tokens, trigger.threshold
+      );
+      self.wire_publisher.send(WireMessage::CompactionWarning {
+        current_tokens: trigger.current_tokens,
+        threshold: trigger.threshold,
+        max_context_size: trigger.max_context_size,
+      });
+      self.execute_compaction(&trigger).await;
+    }
+  }
+
+  /// Execute compaction on the current messages.
+  ///
+  /// Uses the configured compaction strategy to compress message history.
+  /// Updates the session store and notifies the UI of completion.
+  /// Triggers `PreCompact` before and `PostCompact` after compaction.
+  async fn execute_compaction(
+    &mut self,
+    trigger: &crate::llm::session::compaction::CompactionTrigger,
+  ) {
+    let trigger_reason = "token_threshold";
+    let _ = self
+      .runtime
+      .hook_engine()
+      .trigger(
+        HookEventType::PreCompact,
+        trigger_reason,
+        hook_events::pre_compact(
+          &self.id,
+          &self.runtime.args.work_dir,
+          trigger_reason,
+          trigger.current_tokens,
+        ),
+      )
+      .await;
+
+    if let Some(result) = self.compaction_service.execute(self.context.messages_mut()) {
+      info!(
+        "Session {}: Compaction completed - {} messages -> {} messages, ~{} tokens",
+        self.id, result.message_count_before, result.message_count_after, result.new_token_count
+      );
+      self
+        .persistence
+        .reset_messages(&self.id, self.context.messages());
+      self.wire_publisher.send(WireMessage::CompactionCompleted {
+        before: result.message_count_before,
+        after: result.message_count_after,
+        tokens: result.new_token_count,
+      });
+
+      let _handle = self.runtime.hook_engine().trigger_fire_and_forget(
+        HookEventType::PostCompact,
+        trigger_reason.to_string(),
+        hook_events::post_compact(
+          &self.id,
+          &self.runtime.args.work_dir,
+          trigger_reason,
+          result.new_token_count,
+        ),
+      );
+    }
+  }
+
+  /// Start a new turn with the explicit agent loop.
+  ///
+  /// Initializes loop state, sends `TurnBegin`, and kicks off the first
+  /// iteration.  The loop continues (via `agent_loop_continue`) until the
+  /// model responds without tool calls or a limit is reached.
+  async fn start_turn(&mut self) {
+    info!("Session {}: Starting new turn", self.id);
+    self.runtime.begin_turn();
+    self.turn_failed = false;
+    self.stop_hook_active = false;
+    self.steering_already_delivered = false;
+    self.wire_publisher.send(WireMessage::TurnBegin);
+    self.agent_loop_state = AgentLoopState::InProgress { step_count: 0 };
+    self.agent_loop_iteration().await;
+  }
+
+  /// Single iteration of the agent loop.
+  ///
+  /// Checks `max_steps_per_turn`, checks compaction, then starts the stream.
+  /// This is called at the beginning of every step (including retries).
+  async fn agent_loop_iteration(&mut self) {
+    let step_count = match self.agent_loop_state {
+      AgentLoopState::InProgress { step_count } => step_count,
+      _ => {
+        // Not inside an agent loop — fall back to a direct stream start.
+        self.start_stream().await;
+        return;
+      }
+    };
+
+    if step_count >= self.max_steps_per_turn {
+      let msg = format!(
+        "Reached maximum steps per turn ({})",
+        self.max_steps_per_turn
+      );
+      self.turn_failed = true;
+      error!("Session {}: {}", self.id, msg);
+      self
+        .wire_publisher
+        .send(WireMessage::Error { message: msg });
+      self.agent_loop_end().await;
+      return;
+    }
+
+    info!(
+      "Session {}: Agent loop step {}/{}",
+      self.id, step_count, self.max_steps_per_turn
+    );
+
+    if !mem::take(&mut self.steering_already_delivered)
+      && let Some(input) = self.meta.input_queue.next(true)
+    {
+      self.accept_queued_input(input, false).await;
+      if self.turn_failed {
+        self.agent_loop_end().await;
+        return;
+      }
+    }
+
+    // Check compaction before *every* step, not just the first one.
+    self.check_and_notify_compaction().await;
+
+    self.start_stream().await;
+  }
+
+  /// Continue the agent loop after tool execution.
+  ///
+  /// Increments the step counter and starts the next iteration.
+  async fn agent_loop_continue(&mut self) {
+    if let AgentLoopState::InProgress { ref mut step_count } = self.agent_loop_state {
+      *step_count += 1;
+    }
+    self.agent_loop_iteration().await;
+  }
+
+  /// End the current turn.
+  ///
+  /// Resets agent-loop state and sends `TurnEnd` to the UI. Then triggers the
+  /// `Stop` lifecycle hook; if it blocks with a reason, that reason is injected
+  /// as a new user message and one additional turn is run.
+  async fn agent_loop_end(&mut self) {
+    let steps = match self.agent_loop_state {
+      AgentLoopState::InProgress { step_count } => step_count,
+      _ => 0,
+    };
+    if !self.turn_failed
+      && steps + 1 < self.max_steps_per_turn
+      && let Some(input) = self.meta.input_queue.next(true)
+      && self.accept_queued_input(input, false).await
+    {
+      self.steering_already_delivered = true;
+      Box::pin(self.agent_loop_continue()).await;
+      return;
+    }
+    if self.turn_failed {
+      self.meta.input_queue.paused = true;
+      self.stop_hook_active = false;
+      self.save_input_queue();
+    }
+    info!("Session {}: Turn ended", self.id);
+    self.agent_loop_state = AgentLoopState::Idle;
+    self.wire_publisher.send(WireMessage::TurnEnd);
+
+    // --- Stop hook (max 1 re-trigger to prevent infinite loop) ---
+    if !self.turn_failed && !mem::take(&mut self.stop_hook_active) {
+      let results = self
+        .runtime
+        .hook_engine()
+        .trigger(
+          HookEventType::Stop,
+          "",
+          hook_events::stop(&self.id, &self.runtime.args.work_dir, false),
+        )
+        .await;
+      for result in results {
+        if let HookDecision::Block { reason } = result.decision
+          && !reason.is_empty()
+        {
+          self.stop_hook_active = true;
+          let user_msg = self.context.push_user(&reason).clone();
+          self.persistence.stage_message(&self.id, &user_msg);
+          self.meta.update_title_from_message(&user_msg);
+          self.meta.updated_at = Local::now();
+          self.persistence.stage_meta(&self.meta);
+          let _ = self.persistence.flush();
+          self.current_response.clear();
+          self.current_thinking.clear();
+          self.pending_tool_calls.clear();
+          self.agent_loop_state = AgentLoopState::InProgress { step_count: steps };
+          // A steering message is a new user prompt: charge a new turn.
+          self.runtime.begin_turn();
+          self.wire_publisher.send(WireMessage::TurnBegin);
+          Box::pin(self.agent_loop_continue()).await;
+          return;
+        }
+      }
+    }
+    self
+      .wire_publisher
+      .send(WireMessage::TurnComplete { blocked: false });
+  }
+
+  /// Start a chat stream with the current messages, with retry support.
+  ///
+  /// If the initial request fails with a retryable error (network timeout,
+  /// rate limit, server error), it will be retried with exponential backoff
+  /// according to the retry configuration.
+  ///
+  /// Mirrors the reference CLI's two-layer retry: connection recovery (rebuild client)
+  /// followed by tenacity-style exponential backoff.
+  /// Start streaming the current context messages via the StreamManager.
+  async fn start_stream(&mut self) {
+    // Deliver pending LLM notifications: claim, append to context as user
+    // messages, then ack. This mirrors the reference CLI's behaviour where
+    // notifications are user-role messages interleaved with history.
+    let manager = self.runtime.background_manager();
+    let delivered = self
+      .runtime
+      .notification_manager()
+      .deliver_pending("llm", 8, |view| {
+        let text = build_notification_message(view, Some(&*manager));
+        self.context.messages_mut().push(Message::user(text));
+        Ok::<(), std::convert::Infallible>(())
+      });
+    self.run_notification_hooks("llm", &delivered);
+
+    // Inject plan-mode reminders while plan mode is active.
+    if let Some(reminder) = self.plan_injection_state.collect(
+      self.plan_mode,
+      self.get_plan_file_path().as_ref(),
+      self.context.messages(),
+    ) {
+      let wrapped = format!(
+        "<system-reminder>\n{}\n</system-reminder>",
+        reminder.content
+      );
+      self.context.messages_mut().push(Message::user(wrapped));
+    }
+
+    let messages = self.context.messages().to_vec();
+
+    match self.stream_manager.start(messages).await {
+      Ok(rx) => {
+        self.stream_rx = Some(rx);
+        self.state = ActorState::Streaming;
+      }
+      Err(err) => {
+        self.turn_failed = true;
+        self.agent_loop_state = AgentLoopState::Idle;
+        self.state = ActorState::Idle;
+        self.meta.input_queue.paused = true;
+        self.save_input_queue();
+        error!("Session {}: failed to start stream: {}", self.id, err);
+        self.wire_publisher.send(WireMessage::Error {
+          message: format_user_friendly_error(&err.to_string()),
+        });
+      }
+    }
+  }
+
+  async fn handle_stream_event(&mut self, event: SessionEvent) {
+    match &event {
+      SessionEvent::ContentChunk(chunk) => {
+        let preview: String = chunk.chars().take(100).collect();
+        debug!(
+          "Session {}: Stream content: len={}, content={}",
+          self.id,
+          chunk.len(),
+          preview
+        );
+        self.current_response.push_str(chunk);
+        // Forward to caller
+        self.wire_publisher.send(WireMessage::ContentChunk {
+          text: chunk.clone(),
+        });
+      }
+      SessionEvent::ThinkingChunk(chunk) => {
+        let preview: String = chunk.chars().take(100).collect();
+        info!(
+          "Session {}: Stream thinking received: len={}, content={}",
+          self.id,
+          chunk.len(),
+          preview
+        );
+        self.current_thinking.push_str(chunk);
+        // Forward to caller without storing in session messages
+        self.wire_publisher.send(WireMessage::ThinkingChunk {
+          text: chunk.clone(),
+        });
+      }
+      SessionEvent::ToolCallReceived {
+        id,
+        name,
+        arguments,
+      } => {
+        info!(
+          "Session {}: Tool call received: id={}, name={}, args={}",
+          self.id, id, name, arguments
+        );
+
+        // Add to pending tool calls
+        self
+          .pending_tool_calls
+          .push(ToolCall::new(id, name, arguments));
+
+        // Forward to caller
+        self.wire_publisher.send(WireMessage::ToolCallBegin {
+          id: id.clone(),
+          name: name.clone(),
+          arguments: arguments.clone(),
+        });
+      }
+      SessionEvent::ToolCallCompleted { name, output } => {
+        info!(
+          "Session {}: Tool call completed: name={}, output_len={}",
+          self.id,
+          name,
+          output.len()
+        );
+        // Forward to caller
+        // Note: id is not available in SessionEvent::ToolCallCompleted, use empty string
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: String::new(),
+          name: name.clone(),
+          output: output.clone(),
+        });
+      }
+      SessionEvent::Usage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+      } => {
+        info!(
+          "Session {}: Precise token usage - total={}, prompt={}, completion={}",
+          self.id, total_tokens, prompt_tokens, completion_tokens
+        );
+        // Store the precise token count
+        self.precise_token_count = Some(*total_tokens);
+        // Check compaction with precise token count
+        self.check_and_notify_compaction().await;
+        // Forward to caller
+        self.wire_publisher.send(WireMessage::Usage {
+          total_tokens: *total_tokens,
+          prompt_tokens: *prompt_tokens,
+          completion_tokens: *completion_tokens,
+          cached_tokens: *cached_tokens,
+        });
+      }
+      SessionEvent::Completed => {
+        // Add the complete assistant message to history (with tool calls if any)
+        let response = mem::take(&mut self.current_response);
+        let thinking = mem::take(&mut self.current_thinking);
+        let tool_calls = mem::take(&mut self.pending_tool_calls);
+
+        let has_content = !response.is_empty() || !thinking.is_empty();
+        let has_tool_calls = !tool_calls.is_empty();
+
+        if has_content || has_tool_calls {
+          let thinking_opt = if thinking.is_empty() {
+            None
+          } else {
+            Some(thinking)
+          };
+          let assistant_msg = self
+            .context
+            .push_assistant(response, thinking_opt, tool_calls.clone())
+            .clone();
+          self.persistence.stage_message(&self.id, &assistant_msg);
+          self.meta.updated_at = Local::now();
+          self.persistence.stage_meta(&self.meta);
+          let _ = self.persistence.flush();
+          info!(
+            "Session {}: Added assistant message, content_len={}, tool_calls={}",
+            self.id,
+            assistant_msg.content.len(),
+            has_tool_calls
+          );
+        }
+
+        self.state = ActorState::Idle;
+        self.stream_rx = None;
+
+        // Use the tool_calls we already have in hand instead of re-reading
+        // from context.messages().last().
+        if !tool_calls.is_empty() {
+          info!(
+            "Session {}: Executing {} tool calls",
+            self.id,
+            tool_calls.len()
+          );
+          self.state = ActorState::ExecutingTools {
+            tool_calls,
+            current_index: 0,
+          };
+          self.continue_tool_call_execution().await;
+          return;
+        }
+
+        // End the turn via the explicit agent loop.
+        self.agent_loop_end().await;
+      }
+      SessionEvent::StreamInterrupted {
+        error,
+        is_retryable,
+      } => {
+        error!("Session {}: Stream interrupted: {}", self.id, error);
+        self.state = ActorState::Idle;
+        self.stream_rx = None;
+        // Do NOT retain partial content — mirrors the reference CLI behaviour
+        self.current_response.clear();
+        self.current_thinking.clear();
+        self.pending_tool_calls.clear();
+
+        if *is_retryable {
+          if matches!(self.agent_loop_state, AgentLoopState::InProgress { .. }) {
+            // Retry the same step (do not increment step_count).
+            self.agent_loop_iteration().await;
+          } else {
+            self.start_stream().await;
+          }
+        } else {
+          self.turn_failed = true;
+          self.run_stop_failure_hook("StreamInterrupted", error);
+          self.wire_publisher.send(WireMessage::Error {
+            message: format_user_friendly_error(error),
+          });
+          if matches!(self.agent_loop_state, AgentLoopState::InProgress { .. }) {
+            self.agent_loop_end().await;
+          }
+        }
+      }
+      SessionEvent::Error(err) => {
+        self.turn_failed = true;
+        error!("Session {}: Stream error: {}", self.id, err);
+        self.run_stop_failure_hook("StreamError", err);
+        self.state = ActorState::Idle;
+        self.stream_rx = None;
+        self.current_response.clear();
+        self.current_thinking.clear();
+        self.pending_tool_calls.clear();
+        // Forward to caller
+        self.wire_publisher.send(WireMessage::Error {
+          message: err.clone(),
+        });
+        if matches!(self.agent_loop_state, AgentLoopState::InProgress { .. }) {
+          self.agent_loop_end().await;
+        }
+      }
+      SessionEvent::Shutdown => {
+        // Should not happen, but handle it
+        self.wire_publisher.send(WireMessage::Error {
+          message: "Session shutdown".to_string(),
+        });
+      }
+      SessionEvent::CompactionNeeded {
+        current_tokens,
+        threshold,
+        max_context_size,
+      } => {
+        // Forward compaction notification to UI
+        self.wire_publisher.send(WireMessage::CompactionWarning {
+          current_tokens: *current_tokens,
+          threshold: *threshold,
+          max_context_size: *max_context_size,
+        });
+      }
+      SessionEvent::ApprovalNeeded {
+        id,
+        name,
+        arguments: _,
+        diff_preview,
+      } => {
+        // ApprovalNeeded is never emitted by the stream task,
+        // but the match must be exhaustive. If it were emitted, it would be
+        // handled through the ApprovalRuntime like any other approval request.
+        let _ = (id, name, diff_preview);
+      }
+      SessionEvent::QuestionsAsked {
+        tool_call_id,
+        questions,
+      } => {
+        // Forward to UI
+        self.wire_publisher.send(WireMessage::QuestionsAsked {
+          tool_call_id: tool_call_id.clone(),
+          questions: questions.clone(),
+        });
+      }
+      SessionEvent::CompactionCompleted {
+        message_count_before,
+        message_count_after,
+        new_token_count,
+      } => {
+        // Forward compaction completion to UI
+        self.wire_publisher.send(WireMessage::CompactionCompleted {
+          before: *message_count_before,
+          after: *message_count_after,
+          tokens: *new_token_count,
+        });
+      }
+    }
+  }
+
+  /// Resume tool call execution from the pending state.
+  ///
+  /// Tools that require UI interaction (AskUserQuestion or manual approval) are
+  /// handled serially because they may pause the actor.  All other approved
+  /// tools are executed concurrently via `execute_tool_batch`.
+  async fn continue_tool_call_execution(&mut self) {
+    let (tool_calls, current_index) = match mem::replace(&mut self.state, ActorState::Idle) {
+      ActorState::ExecutingTools {
+        tool_calls,
+        current_index,
+      } => (tool_calls, current_index),
+      _ => {
+        error!(
+          "Session {}: continue_tool_call_execution called with no state",
+          self.id
+        );
+        return;
+      }
+    };
+
+    let mut batch: Vec<&ToolCall> = Vec::new();
+
+    for (i, tool_call) in tool_calls.iter().enumerate().skip(current_index) {
+      self.wire_publisher.send(WireMessage::ToolCallBegin {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        arguments: tool_call.arguments.clone(),
+      });
+
+      if !self.tool_executor.allows(&tool_call.name) {
+        let output = format!("Tool '{}' is not available to this agent.", tool_call.name);
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: tool_call.id.clone(),
+          name: tool_call.name.clone(),
+          output: output.clone(),
+        });
+        self.context.push_tool_result(&tool_call.id, &output);
+        self
+          .persistence
+          .stage_message(&self.id, &Message::tool(&output, &tool_call.id));
+        let _ = self.persistence.flush();
+        continue;
+      }
+
+      // Plan mode: reject non-read-only tools immediately, unless the tool
+      // is writing to the current plan file.
+      if self.plan_mode
+        && !self.is_tool_allowed_in_plan_mode(&tool_call.name)
+        && !self.is_plan_file_target(tool_call)
+      {
+        let error_msg = format!(
+          "Tool '{}' is not available in plan mode. \
+           Only read-only tools (ReadFile, Glob, Grep, SearchWeb, FetchURL) \
+           and edits to the plan file are allowed while planning.",
+          tool_call.name
+        );
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: tool_call.id.clone(),
+          name: tool_call.name.clone(),
+          output: error_msg.clone(),
+        });
+        self.context.push_tool_result(&tool_call.id, &error_msg);
+        let tool_msg = Message::tool(&error_msg, &tool_call.id);
+        self.persistence.stage_message(&self.id, &tool_msg);
+        let _ = self.persistence.flush();
+        warn!(
+          "Session {}: Blocked tool {} in plan mode",
+          self.id, tool_call.name
+        );
+        continue;
+      }
+
+      // Special handling for EnterPlanMode: pause execution and wait for user confirmation
+      if tool_call.name == "EnterPlanMode" {
+        // Guard: already in plan mode
+        if self.plan_mode {
+          let error_msg =
+            "Already in plan mode. Use ExitPlanMode when your plan is ready.".to_string();
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: error_msg.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &error_msg);
+          let tool_msg = Message::tool(&error_msg, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+
+        // YOLO mode: auto-approve
+        if self.approval_service.is_yolo() {
+          if !batch.is_empty() {
+            self.execute_tool_batch(std::mem::take(&mut batch)).await;
+          }
+          self.handle_plan_mode_transition(true).await;
+          let plan_path = self.get_plan_file_path().unwrap_or_default();
+          let output = format!(
+            "Plan mode activated (auto-approved in non-interactive mode).\n\
+             Plan file: {}\n\
+             Workflow: identify key questions about the codebase → 
+             use Agent(subagent_type='explore') to investigate if needed → \
+             design approach → \
+             modify the plan file with WriteFile or StrReplaceFile \
+             (create it with WriteFile first if it does not exist) → \
+             call ExitPlanMode.\n",
+            plan_path.display()
+          );
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: output.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &output);
+          let tool_msg = Message::tool(&output, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+
+        // Flush pending batch before pausing.
+        if !batch.is_empty() {
+          self.execute_tool_batch(std::mem::take(&mut batch)).await;
+        }
+
+        info!(
+          "Session {}: EnterPlanMode paused, waiting for user confirmation",
+          self.id
+        );
+        self.state = ActorState::WaitingEnterPlanMode {
+          tool_calls: tool_calls.clone(),
+          current_index: i,
+          tool_call_id: tool_call.id.clone(),
+        };
+        self.wire_publisher.send(WireMessage::QuestionsAsked {
+          tool_call_id: tool_call.id.clone(),
+          questions: vec![Question {
+            question: "Enter plan mode?".to_string(),
+            header: "Plan Mode".to_string(),
+            options: vec![
+              QuestionOption {
+                label: "Yes".to_string(),
+                description: "Enter plan mode to explore and design an approach".to_string(),
+              },
+              QuestionOption {
+                label: "No".to_string(),
+                description: "Skip planning, start implementing now".to_string(),
+              },
+            ],
+            multi_select: false,
+            confirmation: true,
+            default: vec![0],
+            required: true,
+          }],
+        });
+        return;
+      }
+
+      // Special handling for ExitPlanMode: pause execution and wait for user approval
+      if tool_call.name == "ExitPlanMode" {
+        // Guard: only works in plan mode
+        if !self.plan_mode {
+          let error_msg =
+            "Not in plan mode. ExitPlanMode is only available during plan mode.".to_string();
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: error_msg.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &error_msg);
+          let tool_msg = Message::tool(&error_msg, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+
+        // Parse arguments to get custom options
+        let exit_args = parse_exit_plan_mode_args(&tool_call.arguments);
+        let has_options = exit_args
+          .as_ref()
+          .map(|a| a.options.as_ref().map(|o| o.len() >= 2).unwrap_or(false))
+          .unwrap_or(false);
+        let custom_options: Vec<(String, String)> = if has_options {
+          exit_args
+            .unwrap()
+            .options
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.label, o.description))
+            .collect()
+        } else {
+          Vec::new()
+        };
+
+        // Read the plan file
+        let plan_path = self.get_plan_file_path().unwrap_or_default();
+        let plan_content = self.read_current_plan();
+
+        if plan_content.is_none() {
+          let error_msg = format!(
+            "No plan file found. Write your plan to {} first, then call ExitPlanMode.",
+            plan_path.display()
+          );
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: error_msg.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &error_msg);
+          let tool_msg = Message::tool(&error_msg, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+        let plan_content = plan_content.unwrap();
+
+        // YOLO mode: auto-approve
+        if self.approval_service.is_yolo() {
+          if !batch.is_empty() {
+            self.execute_tool_batch(std::mem::take(&mut batch)).await;
+          }
+          self.handle_plan_mode_transition(false).await;
+          let output = format!(
+            "Plan approved (auto-approved in non-interactive mode). \
+             Plan mode deactivated. All tools are now available.\n\
+             Plan saved to: {}\n\n\
+             ## Approved Plan:\n{}",
+            plan_path.display(),
+            plan_content
+          );
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: output.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &output);
+          let tool_msg = Message::tool(&output, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+
+        // Flush pending batch before pausing.
+        if !batch.is_empty() {
+          self.execute_tool_batch(std::mem::take(&mut batch)).await;
+        }
+
+        // Build question options
+        let mut question_options = Vec::new();
+        if has_options {
+          for (label, description) in &custom_options {
+            question_options.push(QuestionOption {
+              label: label.clone(),
+              description: description.clone(),
+            });
+          }
+        } else {
+          question_options.push(QuestionOption {
+            label: "Approve".to_string(),
+            description: "Exit plan mode and start execution".to_string(),
+          });
+        }
+        question_options.push(QuestionOption {
+          label: "Reject".to_string(),
+          description: "Reject and stay in plan mode".to_string(),
+        });
+        question_options.push(QuestionOption {
+          label: "Reject and Exit".to_string(),
+          description: "Reject and exit plan mode".to_string(),
+        });
+        question_options.push(QuestionOption {
+          label: "Revise".to_string(),
+          description: "Stay in plan mode and provide feedback".to_string(),
+        });
+
+        // Display plan content inline
+        self.wire_publisher.send(WireMessage::PlanDisplay {
+          content: plan_content.clone(),
+          file_path: plan_path.display().to_string(),
+        });
+
+        info!(
+          "Session {}: ExitPlanMode paused, waiting for user approval",
+          self.id
+        );
+        let all_option_labels: Vec<String> =
+          question_options.iter().map(|o| o.label.clone()).collect();
+        self.state = ActorState::WaitingExitPlanMode {
+          tool_calls: tool_calls.clone(),
+          current_index: i,
+          tool_call_id: tool_call.id.clone(),
+          has_options,
+          option_labels: custom_options.into_iter().map(|(l, _)| l).collect(),
+          all_option_labels,
+        };
+        self.wire_publisher.send(WireMessage::QuestionsAsked {
+          tool_call_id: tool_call.id.clone(),
+          questions: vec![Question {
+            question: "Approve this plan".to_string(),
+            header: "Plan".to_string(),
+            options: question_options,
+            multi_select: false,
+            confirmation: false,
+            default: vec![0],
+            required: true,
+          }],
+        });
+        return;
+      }
+
+      // Special handling for AskUserQuestion: pause execution and wait for answers
+      if tool_call.name == "AskUserQuestion" {
+        if self.approval_service.is_yolo() {
+          info!(
+            "Session {}: AskUserQuestion in YOLO mode, auto-dismissing",
+            self.id
+          );
+
+          // Flush any pending batch before handling the inline response.
+          if !batch.is_empty() {
+            self.execute_tool_batch(std::mem::take(&mut batch)).await;
+          }
+
+          let output = r#"{"answers": {}, "note": "Running in non-interactive (yolo) mode. Make your own decision."}"#.to_string();
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: output.clone(),
+          });
+          self.context.push_tool_result(&tool_call.id, &output);
+          let tool_msg = Message::tool(&output, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          continue;
+        }
+
+        // Flush pending batch before pausing.
+        if !batch.is_empty() {
+          self.execute_tool_batch(std::mem::take(&mut batch)).await;
+        }
+
+        match parse_ask_user_questions(&tool_call.arguments) {
+          Ok(questions) => {
+            info!(
+              "Session {}: AskUserQuestion paused, waiting for user answers",
+              self.id
+            );
+            self.state = ActorState::WaitingAnswers {
+              tool_calls: tool_calls.clone(),
+              current_index: i,
+              tool_call_id: tool_call.id.clone(),
+            };
+            self.wire_publisher.send(WireMessage::QuestionsAsked {
+              tool_call_id: tool_call.id.clone(),
+              questions,
+            });
+            return;
+          }
+          Err(e) => {
+            error!(
+              "Session {}: Failed to parse AskUserQuestion arguments: {}",
+              self.id, e
+            );
+            let error_msg = format!("Error: Invalid AskUserQuestion arguments: {}", e);
+            self.wire_publisher.send(WireMessage::ToolCallEnd {
+              id: tool_call.id.clone(),
+              name: tool_call.name.clone(),
+              output: error_msg.clone(),
+            });
+            self.context.push_tool_result(&tool_call.id, &error_msg);
+            let tool_msg = Message::tool(&error_msg, &tool_call.id);
+            self.persistence.stage_message(&self.id, &tool_msg);
+            let _ = self.persistence.flush();
+            continue;
+          }
+        }
+      }
+
+      let diff_preview = self.tool_executor.preview(tool_call).await;
+
+      // Plan file writes are auto-approved; everything else goes through policy.
+      let decision = if self.is_plan_file_target(tool_call) {
+        ApprovalDecision::Approved
+      } else {
+        self.approval_service.decide(tool_call, diff_preview)
+      };
+
+      match decision {
+        ApprovalDecision::Approved => {
+          batch.push(tool_call);
+        }
+        ApprovalDecision::NeedsApproval {
+          tool_call_id,
+          name,
+          diff_preview,
+        } => {
+          // Flush pending batch before pausing for approval.
+          if !batch.is_empty() {
+            self.execute_tool_batch(std::mem::take(&mut batch)).await;
+          }
+
+          info!(
+            "Session {}: Tool {} requires approval, pausing execution",
+            self.id, name
+          );
+          self.state = ActorState::WaitingApproval {
+            tool_calls: tool_calls.clone(),
+            current_index: i,
+            approved_indices: vec![],
+            rejected_indices: vec![],
+          };
+          self.submit_approval_request(tool_call_id, name, diff_preview, i + 1, tool_calls.len());
+          return;
+        }
+      }
+    }
+
+    // Execute any remaining approved tools concurrently.
+    if !batch.is_empty() {
+      self.execute_tool_batch(batch).await;
+    }
+
+    info!(
+      "Session {}: Continuing conversation after tool execution",
+      self.id
+    );
+
+    info!(
+      "Session {}: Updated message history for next request:",
+      self.id
+    );
+    for (i, msg) in self.context.messages().iter().enumerate() {
+      let content_preview: String = msg.content.chars().take(100).collect();
+      let tool_calls_info = if let Some(ref tc) = msg.tool_calls {
+        format!(" [tool_calls: {}]", tc.len())
+      } else {
+        String::new()
+      };
+      let tool_call_id_info = if let Some(ref id) = msg.tool_call_id {
+        format!(" [tool_call_id: {}]", id)
+      } else {
+        String::new()
+      };
+      info!(
+        "  [{}] {:?}: {}{}{}",
+        i, msg.role, content_preview, tool_calls_info, tool_call_id_info
+      );
+    }
+
+    self.current_response.clear();
+    self.current_thinking.clear();
+    self.agent_loop_continue().await;
+  }
+
+  /// Execute a batch of approved tool calls concurrently.
+  ///
+  /// Results are processed in the original order so that context messages
+  /// remain deterministic. Also handles plan mode state transitions for
+  /// EnterPlanMode and ExitPlanMode.
+  async fn execute_tool_batch(&mut self, tool_calls: Vec<&ToolCall>) {
+    let results = self.tool_executor.execute_many(&tool_calls).await;
+
+    for (tool_call, result) in tool_calls.iter().zip(results) {
+      match result {
+        Ok(output) => {
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: output.clone(),
+          });
+          info!(
+            "Session {}: Adding tool result message: tool_call_id={}, output_preview={}...",
+            self.id,
+            tool_call.id,
+            output.chars().take(100).collect::<String>()
+          );
+          self.context.push_tool_result(&tool_call.id, &output);
+          let tool_msg = Message::tool(&output, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          info!(
+            "Session {}: Tool {} executed successfully, output_len={}",
+            self.id,
+            tool_call.name,
+            output.len()
+          );
+
+          // Handle plan mode state transitions for tools executed via batch
+          if tool_call.name == "EnterPlanMode" {
+            self.handle_plan_mode_transition(true).await;
+          } else if tool_call.name == "ExitPlanMode" {
+            self.handle_plan_mode_transition(false).await;
+          }
+        }
+        Err(e) => {
+          let error_msg = format!("Error: {}", e);
+          self.wire_publisher.send(WireMessage::ToolCallEnd {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            output: error_msg.clone(),
+          });
+          info!(
+            "Session {}: Adding tool error message: tool_call_id={}, error={}",
+            self.id, tool_call.id, error_msg
+          );
+          self.context.push_tool_result(&tool_call.id, &error_msg);
+          let tool_msg = Message::tool(&error_msg, &tool_call.id);
+          self.persistence.stage_message(&self.id, &tool_msg);
+          let _ = self.persistence.flush();
+          error!("Session {}: Tool {} failed: {}", self.id, tool_call.name, e);
+        }
+      }
+    }
+  }
+
+  /// Handle a `/plan` slash command from the UI.
+  async fn handle_plan_slash_command(&mut self, subcmd: &str) {
+    let subcmd = subcmd.trim().to_lowercase();
+
+    match subcmd.as_str() {
+      "on" => {
+        self.handle_plan_mode_transition(true).await;
+        let path = self
+          .get_plan_file_path()
+          .map(|p| p.display().to_string())
+          .unwrap_or_default();
+        self.wire_publisher.send(WireMessage::Text {
+          text: format!("Plan mode ON. Plan file: {}", path),
+        });
+      }
+      "off" => {
+        self.handle_plan_mode_transition(false).await;
+        self.wire_publisher.send(WireMessage::Text {
+          text: "Plan mode OFF. All tools are now available.".to_string(),
+        });
+      }
+      "view" => {
+        let plan_path = self.get_plan_file_path();
+        match self.read_current_plan() {
+          Some(content) => {
+            self.wire_publisher.send(WireMessage::PlanDisplay {
+              content,
+              file_path: plan_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            });
+          }
+          None => {
+            self.wire_publisher.send(WireMessage::Text {
+              text: "No plan file found for this session.".to_string(),
+            });
+          }
+        }
+      }
+      "clear" => {
+        if let Some(path) = self.get_plan_file_path()
+          && path.exists()
+          && let Err(e) = std::fs::remove_file(&path)
+        {
+          self.wire_publisher.send(WireMessage::Error {
+            message: format!("Failed to clear plan file: {}", e),
+          });
+          return;
+        }
+        self.wire_publisher.send(WireMessage::Text {
+          text: "Plan cleared.".to_string(),
+        });
+      }
+      _ => {
+        // Default: toggle
+        let new_state = !self.plan_mode;
+        self.handle_plan_mode_transition(new_state).await;
+        if self.plan_mode {
+          let path = self
+            .get_plan_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+          self.wire_publisher.send(WireMessage::Text {
+            text: format!(
+              "Plan mode ON. Write your plan to: {}\n\
+               Use ExitPlanMode when done, or /plan off to exit manually.",
+              path
+            ),
+          });
+        } else {
+          self.wire_publisher.send(WireMessage::Text {
+            text: "Plan mode OFF. All tools are now available.".to_string(),
+          });
+        }
+      }
+    }
+  }
+
+  /// Toggle plan mode state and notify UI.
+  async fn handle_plan_mode_transition(&mut self, entering: bool) {
+    if entering {
+      if !self.plan_mode {
+        self.plan_mode = true;
+        self.meta.plan_mode = true;
+        // Allocate a stable plan session ID and slug on first activation.
+        if self.plan_session_id.is_none() {
+          let plan_session_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+          let slug = get_or_create_slug(&plan_session_id);
+          self.plan_session_id = Some(plan_session_id.clone());
+          self.meta.plan_session_id = Some(plan_session_id);
+          self.meta.plan_slug = Some(slug);
+        }
+        self.persistence.stage_meta(&self.meta);
+        let _ = self.persistence.flush();
+        self
+          .wire_publisher
+          .send(WireMessage::PlanModeChanged { active: true });
+        info!("Session {}: Entered plan mode", self.id);
+      }
+    } else if self.plan_mode {
+      self.plan_mode = false;
+      self.meta.plan_mode = false;
+      // Clear plan session state when exiting.
+      self.plan_session_id = None;
+      self.meta.plan_session_id = None;
+      self.meta.plan_slug = None;
+      self.persistence.stage_meta(&self.meta);
+      let _ = self.persistence.flush();
+      self
+        .wire_publisher
+        .send(WireMessage::PlanModeChanged { active: false });
+      info!("Session {}: Exited plan mode", self.id);
+    }
+  }
+
+  /// Get the plan file path for the current planning session.
+  fn get_plan_file_path(&self) -> Option<PathBuf> {
+    self
+      .plan_session_id
+      .as_ref()
+      .map(|id| plan_file_path(id, None))
+  }
+
+  /// Read the current plan file content, if any.
+  fn read_current_plan(&self) -> Option<String> {
+    self
+      .plan_session_id
+      .as_ref()
+      .and_then(|id| read_plan(id, None))
+  }
+
+  /// Returns true if the given tool is allowed in plan mode.
+  fn is_tool_allowed_in_plan_mode(&self, tool_name: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+      "ReadFile",
+      "Glob",
+      "Grep",
+      "SearchWeb",
+      "FetchURL",
+      "AskUserQuestion",
+      "EnterPlanMode",
+      "ExitPlanMode",
+    ];
+    ALLOWED.contains(&tool_name)
+  }
+
+  /// Returns true if the tool call targets the current plan file.
+  fn is_plan_file_target(&self, tool_call: &ToolCall) -> bool {
+    if !matches!(tool_call.name.as_str(), "WriteFile" | "ReplaceFile") {
+      return false;
+    }
+    let Some(plan_path) = self.get_plan_file_path() else {
+      return false;
+    };
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(target_path) = extract_tool_path_argument(&tool_call.arguments, cwd.as_path()) else {
+      return false;
+    };
+    match std::fs::canonicalize(&target_path) {
+      Ok(canonical) => canonical == plan_path,
+      Err(_) => target_path == plan_path,
+    }
+  }
+
+  /// Execute a single tool call and store the result.
+  async fn execute_single_tool_call(&mut self, tool_call: &ToolCall) {
+    match self.tool_executor.execute(tool_call).await {
+      Ok(output) => {
+        let output_str = output;
+
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: tool_call.id.clone(),
+          name: tool_call.name.clone(),
+          output: output_str.clone(),
+        });
+
+        info!(
+          "Session {}: Adding tool result message: tool_call_id={}, output_preview={}...",
+          self.id,
+          tool_call.id,
+          output_str.chars().take(100).collect::<String>()
+        );
+        self.context.push_tool_result(&tool_call.id, &output_str);
+        let tool_msg = Message::tool(&output_str, &tool_call.id);
+        self.persistence.stage_message(&self.id, &tool_msg);
+        let _ = self.persistence.flush();
+        info!(
+          "Session {}: Tool {} executed successfully, output_len={}",
+          self.id,
+          tool_call.name,
+          output_str.len()
+        );
+      }
+      Err(e) => {
+        let error_msg = format!("Error: {}", e);
+
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: tool_call.id.clone(),
+          name: tool_call.name.clone(),
+          output: error_msg.clone(),
+        });
+
+        info!(
+          "Session {}: Adding tool error message: tool_call_id={}, error={}",
+          self.id, tool_call.id, error_msg
+        );
+        self.context.push_tool_result(&tool_call.id, &error_msg);
+        let tool_msg = Message::tool(&error_msg, &tool_call.id);
+        self.persistence.stage_message(&self.id, &tool_msg);
+        let _ = self.persistence.flush();
+        error!("Session {}: Tool {} failed: {}", self.id, tool_call.name, e);
+      }
+    }
+  }
+
+  /// Submit an approval request to the cross-session ApprovalRuntime.
+  ///
+  /// Stores the returned oneshot receiver so the actor's run loop can await the
+  /// user's response without blocking command processing.
+  fn submit_approval_request(
+    &mut self,
+    tool_call_id: String,
+    name: String,
+    diff_preview: Option<String>,
+    position: usize,
+    total: usize,
+  ) {
+    let source_kind = if self.is_subagent() {
+      Some("subagent".to_string())
+    } else {
+      None
+    };
+    let (_approval_id, rx) = self.runtime.approval_runtime().submit_request(
+      self.id.clone(),
+      source_kind,
+      tool_call_id,
+      name,
+      diff_preview,
+      position,
+      total,
+    );
+    self.approval_rx = Some(rx);
+  }
+
+  /// Returns true if this actor is running a subagent session.
+  fn is_subagent(&self) -> bool {
+    self.is_subagent
+  }
+
+  /// Handle the result of an approval request resolved by the ApprovalRuntime.
+  async fn handle_approval_result(&mut self, result: ApprovalResult) {
+    let (tool_calls, current_index, approved_indices, rejected_indices) =
+      match mem::replace(&mut self.state, ActorState::Idle) {
+        ActorState::WaitingApproval {
+          tool_calls,
+          current_index,
+          approved_indices,
+          rejected_indices,
+        } => (
+          tool_calls,
+          current_index,
+          approved_indices,
+          rejected_indices,
+        ),
+        _ => {
+          error!(
+            "Session {}: Received approval result but no tool execution is pending",
+            self.id
+          );
+          return;
+        }
+      };
+
+    self
+      .apply_approval_decision(
+        tool_calls,
+        current_index,
+        approved_indices,
+        rejected_indices,
+        result.approved,
+        result.reject_remaining,
+      )
+      .await;
+  }
+
+  /// Handle user approval or denial of a pending tool call.
+  ///
+  /// Records the decision in the approval queue and advances to the next tool
+  /// that still needs manual approval.  Only when the queue is exhausted are
+  /// all approved tools executed in a single batch.
+  async fn handle_approval(
+    &mut self,
+    tool_call_id: String,
+    approved: bool,
+    reject_remaining: bool,
+  ) {
+    let (tool_calls, current_index, approved_indices, rejected_indices) =
+      match mem::replace(&mut self.state, ActorState::Idle) {
+        ActorState::WaitingApproval {
+          tool_calls,
+          current_index,
+          approved_indices,
+          rejected_indices,
+        } => (
+          tool_calls,
+          current_index,
+          approved_indices,
+          rejected_indices,
+        ),
+        _ => {
+          error!(
+            "Session {}: Received approval but no tool execution is pending",
+            self.id
+          );
+          return;
+        }
+      };
+
+    let tool_call = &tool_calls[current_index];
+    if tool_call.id != tool_call_id {
+      error!(
+        "Session {}: Approval tool_call_id mismatch: expected {}, got {}",
+        self.id, tool_call.id, tool_call_id
+      );
+      self.state = ActorState::WaitingApproval {
+        tool_calls,
+        current_index,
+        approved_indices,
+        rejected_indices,
+      };
+      return;
+    }
+
+    self
+      .apply_approval_decision(
+        tool_calls,
+        current_index,
+        approved_indices,
+        rejected_indices,
+        approved,
+        reject_remaining,
+      )
+      .await;
+  }
+
+  /// Apply an approval decision to the current tool and advance the queue.
+  async fn apply_approval_decision(
+    &mut self,
+    tool_calls: Vec<ToolCall>,
+    current_index: usize,
+    mut approved_indices: Vec<usize>,
+    mut rejected_indices: Vec<usize>,
+    approved: bool,
+    reject_remaining: bool,
+  ) {
+    let tool_call = &tool_calls[current_index];
+
+    if approved {
+      info!(
+        "Session {}: User approved tool {} (queued for batch execution)",
+        self.id, tool_call.name
+      );
+      approved_indices.push(current_index);
+    } else {
+      let denied_msg = format!("User declined to execute tool: {}", tool_call.name);
+      info!(
+        "Session {}: User denied tool {}: {}",
+        self.id, tool_call.name, denied_msg
+      );
+
+      self.wire_publisher.send(WireMessage::ToolCallEnd {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        output: denied_msg.clone(),
+      });
+
+      self.context.push_tool_result(&tool_call.id, &denied_msg);
+      let tool_msg = Message::tool(&denied_msg, &tool_call.id);
+      self.persistence.stage_message(&self.id, &tool_msg);
+      let _ = self.persistence.flush();
+
+      rejected_indices.push(current_index);
+    }
+
+    // Bulk-deny: reject every remaining non-interactive tool.
+    if !approved && reject_remaining {
+      for (i, tc) in tool_calls.iter().enumerate().skip(current_index + 1) {
+        if matches!(
+          tc.name.as_str(),
+          "AskUserQuestion" | "EnterPlanMode" | "ExitPlanMode"
+        ) {
+          continue;
+        }
+        rejected_indices.push(i);
+        let denied_msg = format!("User declined to execute tool: {}", tc.name);
+        self.wire_publisher.send(WireMessage::ToolCallEnd {
+          id: tc.id.clone(),
+          name: tc.name.clone(),
+          output: denied_msg.clone(),
+        });
+        self.context.push_tool_result(&tc.id, &denied_msg);
+        let tool_msg = Message::tool(&denied_msg, &tc.id);
+        self.persistence.stage_message(&self.id, &tool_msg);
+      }
+      let _ = self.persistence.flush();
+    }
+
+    // Scan forward to find the next tool that still needs manual approval.
+    let start_index = if reject_remaining {
+      tool_calls.len()
+    } else {
+      current_index + 1
+    };
+
+    let total = tool_calls.len();
+    for i in start_index..total {
+      if matches!(
+        tool_calls[i].name.as_str(),
+        "AskUserQuestion" | "EnterPlanMode" | "ExitPlanMode"
+      ) {
+        continue;
+      }
+
+      let diff_preview = self.tool_executor.preview(&tool_calls[i]).await;
+      match self
+        .approval_service
+        .decide(&tool_calls[i], diff_preview.clone())
+      {
+        ApprovalDecision::NeedsApproval {
+          tool_call_id: next_id,
+          name: next_name,
+          diff_preview: next_diff,
+        } => {
+          self.state = ActorState::WaitingApproval {
+            tool_calls,
+            current_index: i,
+            approved_indices,
+            rejected_indices,
+          };
+          self.submit_approval_request(next_id, next_name, next_diff, i + 1, total);
+          return;
+        }
+        ApprovalDecision::Approved => {
+          // User may have enabled YOLO since the last scan, so subsequent
+          // tools can flip to auto-approved.  Queue them for batch execution.
+          approved_indices.push(i);
+        }
+      }
+    }
+
+    // Queue exhausted — execute every approved tool in order.
+    for &i in &approved_indices {
+      self.execute_single_tool_call(&tool_calls[i]).await;
+    }
+
+    info!(
+      "Session {}: Approval queue complete — {} approved, {} rejected",
+      self.id,
+      approved_indices.len(),
+      rejected_indices.len()
+    );
+
+    let total = tool_calls.len();
+    self.state = ActorState::ExecutingTools {
+      tool_calls,
+      current_index: total,
+    };
+    self.continue_tool_call_execution().await;
+  }
+
+  /// Handle user answers to structured questions from AskUserQuestion.
+  async fn handle_question_answers(
+    &mut self,
+    tool_call_id: String,
+    answers: Vec<Vec<usize>>,
+    dismissed: bool,
+  ) {
+    let (tool_calls, current_index, expected_id) =
+      match mem::replace(&mut self.state, ActorState::Idle) {
+        ActorState::WaitingAnswers {
+          tool_calls,
+          current_index,
+          tool_call_id: expected_id,
+        } => (tool_calls, current_index, expected_id),
+        _ => {
+          error!(
+            "Session {}: Received question answers but no questions are pending",
+            self.id
+          );
+          return;
+        }
+      };
+
+    if expected_id != tool_call_id {
+      error!(
+        "Session {}: Question answer tool_call_id mismatch: expected {}, got {}",
+        self.id, expected_id, tool_call_id
+      );
+      self.state = ActorState::WaitingAnswers {
+        tool_calls,
+        current_index,
+        tool_call_id: expected_id,
+      };
+      return;
+    }
+
+    let tool_call = &tool_calls[current_index];
+
+    let output = if dismissed || answers.is_empty() {
+      info!("Session {}: User dismissed AskUserQuestion", self.id);
+      r#"{"answers": {}, "note": "User dismissed the question without answering."}"#.to_string()
+    } else {
+      // Build the answers JSON matching the reference CLI format:
+      // {"answers": {"Question text": "Selected label"}} for single-select
+      // {"answers": {"Question text": ["Label A", "Label B"]}} for multi-select
+      let mut answers_map = serde_json::Map::new();
+      // We need the original questions to map indices to labels.
+      // Re-parse the arguments to get the question texts and option labels.
+      if let Ok(args) = parse_ask_user_question_args(&tool_call.arguments) {
+        for (q_idx, selected) in answers.iter().enumerate() {
+          if let Some(q) = args.questions.get(q_idx) {
+            let key = &q.question;
+            if q.multi_select {
+              let labels: Vec<String> = selected
+                .iter()
+                .filter_map(|&idx| q.options.get(idx).map(|o| o.label.clone()))
+                .collect();
+              answers_map.insert(key.clone(), serde_json::json!(labels));
+            } else if let Some(&idx) = selected.first()
+              && let Some(opt) = q.options.get(idx)
+            {
+              answers_map.insert(key.clone(), serde_json::json!(opt.label));
+            }
+          }
+        }
+      }
+      let obj = serde_json::json!({"answers": answers_map});
+      obj.to_string()
+    };
+
+    info!(
+      "Session {}: AskUserQuestion answered, output_len={}",
+      self.id,
+      output.len()
+    );
+
+    self.wire_publisher.send(WireMessage::ToolCallEnd {
+      id: tool_call.id.clone(),
+      name: tool_call.name.clone(),
+      output: output.clone(),
+    });
+
+    self.context.push_tool_result(&tool_call.id, &output);
+    let tool_msg = Message::tool(&output, &tool_call.id);
+    self.persistence.stage_message(&self.id, &tool_msg);
+    let _ = self.persistence.flush();
+
+    let next_index = current_index + 1;
+    self.state = ActorState::ExecutingTools {
+      tool_calls,
+      current_index: next_index,
+    };
+    self.continue_tool_call_execution().await;
+  }
+
+  /// Handle user confirmation to enter plan mode.
+  async fn handle_plan_mode_enter_answer(
+    &mut self,
+    tool_call_id: String,
+    answers: Vec<Vec<usize>>,
+    dismissed: bool,
+  ) {
+    let (tool_calls, current_index, expected_id) =
+      match mem::replace(&mut self.state, ActorState::Idle) {
+        ActorState::WaitingEnterPlanMode {
+          tool_calls,
+          current_index,
+          tool_call_id: expected_id,
+        } => (tool_calls, current_index, expected_id),
+        _ => {
+          error!(
+            "Session {}: Received plan mode enter answer but no confirmation is pending",
+            self.id
+          );
+          return;
+        }
+      };
+
+    if expected_id != tool_call_id {
+      error!(
+        "Session {}: Plan mode enter tool_call_id mismatch: expected {}, got {}",
+        self.id, expected_id, tool_call_id
+      );
+      self.state = ActorState::WaitingEnterPlanMode {
+        tool_calls,
+        current_index,
+        tool_call_id: expected_id,
+      };
+      return;
+    }
+
+    let tool_call = &tool_calls[current_index];
+    let plan_path = self.get_plan_file_path().unwrap_or_default();
+
+    // Map answer: index 0 = Yes, index 1 = No
+    let approved = !dismissed && answers.first().and_then(|a| a.first()).copied() == Some(0);
+
+    let output = if dismissed {
+      info!("Session {}: User dismissed EnterPlanMode", self.id);
+      "User dismissed without choosing. Proceed with implementation directly.".to_string()
+    } else if approved {
+      self.handle_plan_mode_transition(true).await;
+      info!("Session {}: User approved entering plan mode", self.id);
+      format!(
+        "Plan mode activated. You MUST NOT edit code files — only read and plan.\n\
+         Plan file: {}\n\
+         Workflow: identify key questions about the codebase → \
+         use Agent(subagent_type='explore') to investigate if needed → \
+         design approach → \
+         modify the plan file with WriteFile or StrReplaceFile \
+         (create it with WriteFile first if it does not exist) → \
+         call ExitPlanMode.\n\
+         Use AskUserQuestion only to clarify missing requirements or choose \
+         between approaches.\n\
+         Do NOT use AskUserQuestion to ask about plan approval.",
+        plan_path.display()
+      )
+    } else {
+      info!("Session {}: User declined entering plan mode", self.id);
+      "User declined to enter plan mode. Please check with user whether \
+       to proceed with implementation directly."
+        .to_string()
+    };
+
+    self.wire_publisher.send(WireMessage::ToolCallEnd {
+      id: tool_call.id.clone(),
+      name: tool_call.name.clone(),
+      output: output.clone(),
+    });
+
+    self.context.push_tool_result(&tool_call.id, &output);
+    let tool_msg = Message::tool(&output, &tool_call.id);
+    self.persistence.stage_message(&self.id, &tool_msg);
+    let _ = self.persistence.flush();
+
+    let next_index = current_index + 1;
+    self.state = ActorState::ExecutingTools {
+      tool_calls,
+      current_index: next_index,
+    };
+    self.continue_tool_call_execution().await;
+  }
+
+  /// Handle user approval of a plan (ExitPlanMode).
+  async fn handle_plan_mode_exit_answer(
+    &mut self,
+    tool_call_id: String,
+    answers: Vec<Vec<usize>>,
+    dismissed: bool,
+  ) {
+    let (tool_calls, current_index, expected_id, has_options, option_labels, all_option_labels) =
+      match mem::replace(&mut self.state, ActorState::Idle) {
+        ActorState::WaitingExitPlanMode {
+          tool_calls,
+          current_index,
+          tool_call_id: expected_id,
+          has_options,
+          option_labels,
+          all_option_labels,
+        } => (
+          tool_calls,
+          current_index,
+          expected_id,
+          has_options,
+          option_labels,
+          all_option_labels,
+        ),
+        _ => {
+          error!(
+            "Session {}: Received plan mode exit answer but no approval is pending",
+            self.id
+          );
+          return;
+        }
+      };
+
+    if expected_id != tool_call_id {
+      error!(
+        "Session {}: Plan mode exit tool_call_id mismatch: expected {}, got {}",
+        self.id, expected_id, tool_call_id
+      );
+      self.state = ActorState::WaitingExitPlanMode {
+        tool_calls,
+        current_index,
+        tool_call_id: expected_id,
+        has_options,
+        option_labels,
+        all_option_labels,
+      };
+      return;
+    }
+
+    let tool_call = &tool_calls[current_index];
+    let plan_path = self.get_plan_file_path().unwrap_or_default();
+    let plan_content = self.read_current_plan().unwrap_or_default();
+
+    // Map answer index to option label
+    let choice = if dismissed || answers.is_empty() {
+      String::new()
+    } else if let Some(first_answer) = answers.first()
+      && let Some(&idx) = first_answer.first()
+      && let Some(label) = all_option_labels.get(idx)
+    {
+      label.clone()
+    } else {
+      String::new()
+    };
+
+    let output = if dismissed || choice.is_empty() {
+      info!("Session {}: User dismissed ExitPlanMode", self.id);
+      "User dismissed without choosing. Plan mode remains active. \
+       Continue working on your plan or call ExitPlanMode again when ready."
+        .to_string()
+    } else if choice == "Reject and Exit" {
+      self.handle_plan_mode_transition(false).await;
+      info!(
+        "Session {}: User rejected plan and exited plan mode",
+        self.id
+      );
+      "Plan rejected by user. Plan mode deactivated. \
+       All tools are now available. Wait for the user's next message."
+        .to_string()
+    } else if choice == "Reject" {
+      info!(
+        "Session {}: User rejected plan, staying in plan mode",
+        self.id
+      );
+      "Plan rejected by user. Stay in plan mode. \
+       The user will provide feedback via conversation. \
+       Wait for the user's next message before revising."
+        .to_string()
+    } else if has_options && option_labels.contains(&choice) {
+      self.handle_plan_mode_transition(false).await;
+      info!(
+        "Session {}: User approved plan with selected approach: {}",
+        self.id, choice
+      );
+      format!(
+        "Plan approved by user. Selected approach: \"{}\"\n\
+         Plan mode deactivated. All tools are now available.\n\
+         Plan saved to: {}\n\n\
+         IMPORTANT: Execute ONLY the selected approach \"{}\". \
+         Ignore other approaches in the plan.\n\n\
+         ## Approved Plan:\n{}",
+        choice,
+        plan_path.display(),
+        choice,
+        plan_content
+      )
+    } else if choice == "Approve" {
+      self.handle_plan_mode_transition(false).await;
+      info!("Session {}: User approved plan", self.id);
+      format!(
+        "Plan approved by user. Plan mode deactivated. \
+         All tools are now available.\n\
+         Plan saved to: {}\n\n\
+         ## Approved Plan:\n{}",
+        plan_path.display(),
+        plan_content
+      )
+    } else {
+      // Revise or other free-text feedback
+      info!("Session {}: User wants to revise plan", self.id);
+      if choice.is_empty() {
+        "User wants to revise the plan. Stay in plan mode. \
+         Wait for the user's next message with feedback before revising."
+          .to_string()
+      } else {
+        format!(
+          "User wants to revise the plan. Stay in plan mode. \
+           Revise based on the feedback below.\n\n\
+           User feedback: {}",
+          choice
+        )
+      }
+    };
+
+    self.wire_publisher.send(WireMessage::ToolCallEnd {
+      id: tool_call.id.clone(),
+      name: tool_call.name.clone(),
+      output: output.clone(),
+    });
+
+    self.context.push_tool_result(&tool_call.id, &output);
+    let tool_msg = Message::tool(&output, &tool_call.id);
+    self.persistence.stage_message(&self.id, &tool_msg);
+    let _ = self.persistence.flush();
+
+    let next_index = current_index + 1;
+    self.state = ActorState::ExecutingTools {
+      tool_calls,
+      current_index: next_index,
+    };
+    self.continue_tool_call_execution().await;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AskUserQuestion argument parsing (used by SessionActor)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct AskUserQuestionArgOption {
+  label: String,
+  #[serde(default)]
+  description: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AskUserQuestionArgQuestion {
+  question: String,
+  #[serde(default)]
+  header: String,
+  #[serde(default)]
+  options: Vec<AskUserQuestionArgOption>,
+  #[serde(default)]
+  multi_select: bool,
+  #[serde(default)]
+  confirmation: bool,
+  #[serde(default)]
+  default: Vec<usize>,
+  #[serde(default)]
+  required: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AskUserQuestionArgs {
+  questions: Vec<AskUserQuestionArgQuestion>,
+}
+
+/// Parse AskUserQuestion arguments from JSON.
+fn parse_ask_user_questions(arguments: &str) -> std::result::Result<Vec<Question>, String> {
+  let args: AskUserQuestionArgs =
+    serde_json::from_str(arguments).map_err(|e| format!("JSON parse error: {}", e))?;
+
+  if args.questions.is_empty() {
+    return Err("At least one question is required.".to_string());
+  }
+
+  if args.questions.len() > 4 {
+    return Err("Maximum 4 questions allowed per call.".to_string());
+  }
+
+  for (idx, q) in args.questions.iter().enumerate() {
+    if q.question.trim().is_empty() {
+      return Err(format!(
+        "Question {}: question text cannot be empty.",
+        idx + 1
+      ));
+    }
+
+    if !q.confirmation {
+      if q.options.len() < 2 {
+        return Err(format!(
+          "Question {}: at least 2 options are required.",
+          idx + 1
+        ));
+      }
+
+      if q.options.len() > 4 {
+        return Err(format!("Question {}: maximum 4 options allowed.", idx + 1));
+      }
+
+      for (opt_idx, opt) in q.options.iter().enumerate() {
+        if opt.label.trim().is_empty() {
+          return Err(format!(
+            "Question {}: option {} label cannot be empty.",
+            idx + 1,
+            opt_idx + 1
+          ));
+        }
+      }
+
+      // Validate default indices
+      let effective_option_count = if q.confirmation { 2 } else { q.options.len() };
+      for (d_idx, &default_idx) in q.default.iter().enumerate() {
+        if default_idx >= effective_option_count {
+          return Err(format!(
+            "Question {}: default index {} (value: {}) is out of range (max: {}).",
+            idx + 1,
+            d_idx + 1,
+            default_idx,
+            effective_option_count.saturating_sub(1)
+          ));
+        }
+      }
+      if !q.multi_select && !q.confirmation && q.default.len() > 1 {
+        return Err(format!(
+          "Question {}: single-select question can have at most one default index.",
+          idx + 1
+        ));
+      }
+    }
+  }
+
+  let questions = args
+    .questions
+    .into_iter()
+    .map(|q| {
+      let options = if q.confirmation {
+        vec![
+          QuestionOption {
+            label: "Yes".to_string(),
+            description: String::new(),
+          },
+          QuestionOption {
+            label: "No".to_string(),
+            description: String::new(),
+          },
+        ]
+      } else {
+        q.options
+          .into_iter()
+          .map(|o| QuestionOption {
+            label: o.label,
+            description: o.description,
+          })
+          .collect()
+      };
+      Question {
+        question: q.question,
+        header: q.header,
+        options,
+        multi_select: q.multi_select,
+        confirmation: q.confirmation,
+        default: q.default,
+        required: q.required,
+      }
+    })
+    .collect();
+
+  Ok(questions)
+}
+
+fn parse_ask_user_question_args(
+  arguments: &str,
+) -> std::result::Result<AskUserQuestionArgs, String> {
+  serde_json::from_str(arguments).map_err(|e| format!("JSON parse error: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// ExitPlanMode argument parsing (used by SessionActor)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct ExitPlanModeArgOption {
+  label: String,
+  #[serde(default)]
+  description: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ExitPlanModeArgs {
+  #[serde(default)]
+  options: Option<Vec<ExitPlanModeArgOption>>,
+}
+
+fn parse_exit_plan_mode_args(arguments: &str) -> std::result::Result<ExitPlanModeArgs, String> {
+  serde_json::from_str(arguments).map_err(|e| format!("JSON parse error: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// Plan file target detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolPathArg {
+  path: String,
+}
+
+/// Extract and resolve the `path` argument from a WriteFile/ReplaceFile call.
+fn extract_tool_path_argument(arguments: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+  let args: ToolPathArg = serde_json::from_str(arguments).ok()?;
+  let path = PathBuf::from(&args.path);
+  Some(if path.is_absolute() {
+    path
+  } else {
+    cwd.join(&path)
+  })
+}
+
+/// ChatSession that runs as an actor
+#[derive(Debug)]
+pub struct ChatSession {
+  task: JoinHandle<()>,
+  /// Session handle for sending commands
+  pub handle: SessionHandle,
+}
+
+impl Drop for ChatSession {
+  fn drop(&mut self) {
+    self.task.abort();
+  }
+}
+
+impl ChatSession {
+  fn new_session(
+    runtime: Arc<Runtime>,
+    system_prompt: String,
+    session_store: Arc<SessionStore>,
+    wire_publisher: WirePublisher,
+  ) -> Result<(Self, Vec<Message>)> {
+    let mut meta = SessionMeta::new(generate_session_id(), &system_prompt);
+    meta.yolo = runtime.yolo();
+    meta.agent_profile = runtime.active_agent.clone();
+    session_store.create(&meta)?;
+    let session =
+      Self::create_with_store(runtime, system_prompt, session_store, meta, wire_publisher)?;
+    Ok((session, Vec::new()))
+  }
+
+  fn resume(
+    id: String,
+    runtime: Arc<Runtime>,
+    session_store: Arc<SessionStore>,
+    mut meta: SessionMeta,
+    mut messages: Vec<Message>,
+    wire_publisher: WirePublisher,
+  ) -> Result<(Self, Vec<Message>)> {
+    if meta.agent_profile.is_some() && runtime.active_agent.is_none() {
+      return Err(
+        crate::cli::runtime::Error::LaborMarket(anyhow::anyhow!(
+          "This session requires its saved agent profile; resolve it before resuming"
+        ))
+        .into(),
+      );
+    }
+    if runtime.active_agent.is_some() {
+      meta.agent_profile = runtime.active_agent.clone();
+      meta.system_prompt = runtime.render_system_prompt();
+      messages.retain(|m| m.role != crate::llm::types::Role::System);
+    }
+    if !messages
+      .iter()
+      .any(|m| m.role == crate::llm::types::Role::System)
+    {
+      messages.insert(0, Message::system(&meta.system_prompt));
+    }
+    session_store.update_meta(&meta)?;
+    let provider = Self::create_provider(&runtime, None)?;
+
+    let session = Self::start_with_messages(
+      id,
+      provider,
+      messages.clone(),
+      session_store,
+      meta,
+      runtime,
+      wire_publisher,
+    );
+    Ok((session, messages))
+  }
+
+  /// Create or resume a chat session using the given mode and persistent store.
+  ///
+  /// Returns the session and the loaded message history (empty for new sessions).
+  pub fn create_or_resume(
+    runtime: Arc<Runtime>,
+    system_prompt: String,
+    session_store: Arc<SessionStore>,
+    mode: SessionMode,
+    wire_publisher: WirePublisher,
+  ) -> Result<(Self, Vec<Message>)> {
+    match mode {
+      SessionMode::New => Self::new_session(runtime, system_prompt, session_store, wire_publisher),
+      SessionMode::ResumeById(id) => {
+        let (meta, messages) = session_store.load(&id)?;
+        Self::resume(id, runtime, session_store, meta, messages, wire_publisher)
+      }
+      SessionMode::ResumeLatest => match session_store.latest_id()? {
+        Some(id) => {
+          let (meta, messages) = session_store.load(&id)?;
+          Self::resume(id, runtime, session_store, meta, messages, wire_publisher)
+        }
+        None => Self::new_session(runtime, system_prompt, session_store, wire_publisher),
+      },
+    }
+  }
+
+  /// Create LLM provider from configuration.
+  ///
+  /// If `model_alias` is `Some`, uses that model's configuration; otherwise
+  /// uses the configured default model. Construction (credentials, gate,
+  /// usage tracking) lives in `crate::llm::factory`.
+  pub(crate) fn create_provider(
+    runtime: &Runtime,
+    model_alias: Option<&str>,
+  ) -> Result<Box<dyn LLMProvider>> {
+    crate::llm::factory::build_provider(runtime, model_alias)
+  }
+
+  /// Start a new chat session from configuration with persistence
+  fn create_with_store(
+    runtime: Arc<Runtime>,
+    system_prompt: impl Into<String>,
+    session_store: Arc<SessionStore>,
+    meta: SessionMeta,
+    wire_publisher: WirePublisher,
+  ) -> Result<Self> {
+    let provider = Self::create_provider(&runtime, None)?;
+    let system_prompt = system_prompt.into();
+    let messages = vec![Message::system(system_prompt.clone())];
+
+    let session = Self::start_with_messages(
+      meta.id.clone(),
+      provider,
+      messages,
+      session_store,
+      meta,
+      runtime,
+      wire_publisher,
+    );
+    info!(
+      "ChatSession {} created from config with store",
+      session.handle.id
+    );
+    Ok(session)
+  }
+
+  /// Start an in-memory subagent session with a filtered tool policy.
+  ///
+  /// Returns a handle and the command sender. The caller is responsible for
+  /// driving the session via commands and consuming wire events.
+  pub fn start_subagent(
+    agent_id: String,
+    provider: Box<dyn LLMProvider>,
+    messages: Vec<Message>,
+    runtime: Arc<Runtime>,
+    wire_publisher: WirePublisher,
+    tool_policy: Option<ToolPolicy>,
+    yolo: bool,
+  ) -> SessionHandle {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let mut meta = SessionMeta::new(agent_id.clone(), "");
+    meta.yolo = yolo;
+
+    let mut handle = SessionHandle {
+      abort_handle: None,
+      id: agent_id.clone(),
+      cmd_tx,
+    };
+
+    let actor = SessionActor::new(SessionActorConfig {
+      id: agent_id,
+      provider,
+      messages,
+      wire_publisher,
+      cmd_rx,
+      session_store: None,
+      meta,
+      runtime,
+      tool_policy,
+    });
+    let task = tokio::spawn(actor.run());
+    handle.abort_handle = Some(task.abort_handle());
+
+    handle
+  }
+
+  /// Internal: start session with given messages and persistence
+  fn start_with_messages(
+    id: String,
+    provider: Box<dyn LLMProvider>,
+    messages: Vec<Message>,
+    session_store: Arc<SessionStore>,
+    meta: SessionMeta,
+    runtime: Arc<Runtime>,
+    wire_publisher: WirePublisher,
+  ) -> Self {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+    let mut handle = SessionHandle {
+      abort_handle: None,
+      id: id.clone(),
+      cmd_tx,
+    };
+
+    let actor = SessionActor::new(SessionActorConfig {
+      id,
+      provider,
+      messages,
+      wire_publisher,
+      cmd_rx,
+      session_store: Some(session_store),
+      meta,
+      runtime,
+      tool_policy: None,
+    });
+    let task = tokio::spawn(actor.run());
+    handle.abort_handle = Some(task.abort_handle());
+
+    Self { handle, task }
+  }
+
+  /// Shutdown the session
+  #[allow(dead_code)]
+  pub fn shutdown(&self) {
+    self.handle.shutdown();
+  }
+
+  /// Give the actor a chance to flush, then drop in-flight work on cancellation.
+  pub async fn close(&mut self) {
+    self.handle.cancel();
+    self.handle.shutdown();
+    if tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.task)
+      .await
+      .is_err()
+    {
+      self.task.abort();
+      let _ = (&mut self.task).await;
+    }
+  }
+}
+
+#[cfg(test)]
+#[path = "actor_tests.rs"]
+mod harness_tests;
